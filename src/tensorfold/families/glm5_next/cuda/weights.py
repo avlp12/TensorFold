@@ -255,18 +255,21 @@ class Weights:
         return total
 
 
-def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
+def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True, world: int = 2) -> Weights:
     """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
 
-    from .split import RankReader
+    from .split import RankReader, validate_topology
 
-    world = 2
+    validate_topology(rank, world)
     cfg = Config.read(model_dir)
+    for name in ("heads", "lin_heads", "dense_width", "moe_width", "shared_width", "vocab"):
+        if getattr(cfg, name) % world:
+            raise ValueError(f"{name} must be divisible by world={world}")
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
     dev = torch.device(device)
-    rd = RankReader(model_dir, rank)
+    rd = RankReader(model_dir, rank, world)
     HL = cfg.heads // world
     LL = cfg.lin_heads // world
 

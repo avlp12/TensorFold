@@ -110,7 +110,7 @@ class GlmEngine:
 
     def __init__(self, model_dir: Path, *, rank: int, master: str, port: int, policy: str = DEFAULT_POLICY,
                  drafter: Path | None = None, context: int | None = None, context_explicit: bool | None = None, serial_only: bool = False, comm=None,
-                 prefill_rows: int | None = None) -> None:
+                 prefill_rows: int | None = None, world: int = 2) -> None:
         """``comm``: a communicator with ``all_gather`` and ``barrier`` instead of NCCL between two machines (tests)."""
 
         import torch
@@ -118,18 +118,22 @@ class GlmEngine:
         from tensorfold.cuda.comm import open_comm
         from .decode import Engine
         from .weights import Config, load
-        from .split import rule
+        from .split import rule, validate_topology
         from tensorfold.cuda.capacity import admit
         from tensorfold.cuda.geometry import (PREFILL_ROWS, dflash2_geometry, dflash2_weights, mla_geometry,
                                               split_weights)
 
+        validate_topology(rank, world)
+        if comm is not None and getattr(comm, "world", world) != world:
+            raise ValueError("communicator world does not match Flash weight topology")
+        self.world = world
         encode_policy(policy)                           # a bad default fails here, not in the first request
         torch.cuda.set_device(0)
         self.torch = torch
         self.rank = rank
         self.policy = "0" if serial_only else policy
         self.serial_only = serial_only
-        self.comm = comm if comm is not None else open_comm(rank, 2, master, port)
+        self.comm = comm if comm is not None else open_comm(rank, world, master, port)
         self.comm.barrier()
         cfg = Config.read(model_dir)
         # Without --context the window stays dense, attending every key without indexer work.
@@ -138,15 +142,15 @@ class GlmEngine:
 
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
         self.mtp_on = mtp_head(drafter is not None, serial_only, cfg.mtp_layers)
-        weights_estimate = split_weights(rule)
+        weights_estimate = split_weights(rule, world=world)
         if not self.mtp_on:
             weights_estimate = without_mtp(weights_estimate, cfg.layers)
         self.capacity_plan = admit(model_dir, context if explicit else cfg.dense_limit, explicit, torch,
-                                   lambda text: mla_geometry(text, 2, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
+                                   lambda text: mla_geometry(text, world, MAX_ROWS, minimum_slots=DENSE_CAPACITY,
                                                              latent=LATENT, mtp=self.mtp_on),
-                                   weights_estimate, rank=rank, world=2, gather=self._gather_ints,
-                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, 2),
-                                   draft_geometry=lambda text: dflash2_geometry(text, 2, MAX_ROWS, ring=DRAFT_RING))
+                                   weights_estimate, rank=rank, world=world, gather=self._gather_ints,
+                                   draft_dir=drafter, draft_weights=lambda d: dflash2_weights(d, world),
+                                   draft_geometry=lambda text: dflash2_geometry(text, world, MAX_ROWS, ring=DRAFT_RING))
         self.limit = self.capacity_plan["context_window"]
         capacity = self.capacity_plan["cache_slots"]
         long_context = self.limit > cfg.dense_limit
@@ -159,12 +163,11 @@ class GlmEngine:
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
         spare = max(0, min(wanted, plan["budget_bytes"] - plan["total_bytes_estimate"]))
         both = self._gather_ints(mine + [spare >> 20])
-        if both[0][:-1] != both[1][:-1]:
-            raise RuntimeError("the two ranks were started with different settings (draft model, context, drafts, "
+        if any(row[:-1] != both[0][:-1] for row in both[1:]):
+            raise RuntimeError("the ranks were started with different settings (draft model, context, drafts, "
                                "TF_GLM_LATENT, TF_GLM_MTP, TF_GLM_DRAFT_RING): "
-                               f"rank 0 {both[0][:-1]}, rank 1 {both[1][:-1]}; pull the draft model on both machines "
-                               "(or pass --drafter none to both) and give both the same flags")
-        self.cache_bytes = min(both[0][-1], both[1][-1]) << 20
+                               f"{[row[:-1] for row in both]} (rank order); give every rank the same flags")
+        self.cache_bytes = min(row[-1] for row in both) << 20
         plan["kept_bytes"] = self.cache_bytes
         for key in ("serving_peak_bytes_estimate", "total_bytes_estimate"):
             plan[key] = plan[key] + self.cache_bytes
@@ -175,7 +178,7 @@ class GlmEngine:
             raise ValueError(("TF_GLM_MTP=0 leaves" if cfg.mtp_layers else "this checkpoint has") + " no MTP head and "
                              "no DFlash2 draft model was given, so every round would decode one token: pull the draft "
                              "model on both machines (--drafter), or pass --no-drafts to both for the serial reference")
-        w = load(model_dir, rank=rank, mtp=self.mtp_on)
+        w = load(model_dir, rank=rank, mtp=self.mtp_on, world=world)
         w.comm = self.comm
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
         self.comm.barrier()
@@ -268,9 +271,9 @@ class GlmEngine:
                 back()
         names = list(best)
         mine = torch.tensor([best[n] for n in names], dtype=torch.float32, device="cuda")
-        got = torch.empty((2 * mine.numel(),), dtype=torch.float32, device="cuda")
+        got = torch.empty((self.world * mine.numel(),), dtype=torch.float32, device="cuda")
         self.comm.all_gather(mine, got)
-        both = dict(zip(names, got.view(2, -1).max(dim=0).values.tolist()))
+        both = dict(zip(names, got.view(self.world, -1).max(dim=0).values.tolist()))
         e.reset()
         if self.drafter is not None:
             self.drafter.reset()
@@ -288,9 +291,9 @@ class GlmEngine:
     def _gather_ints(self, values: list[int]) -> list[list[int]]:
         torch = self.torch
         mine = torch.tensor(values, dtype=torch.int32, device="cuda")
-        got = torch.empty((2 * len(values),), dtype=torch.int32, device="cuda")
+        got = torch.empty((self.world * len(values),), dtype=torch.int32, device="cuda")
         self.comm.all_gather(mine, got)
-        return [got[:len(values)].tolist(), got[len(values):].tolist()]
+        return got.view(self.world, len(values)).tolist()
 
     # the idle doorbell: rank 1 waits for each request on the rendezvous store (no store: no doorbell), not in NCCL
     def _store(self):
@@ -300,7 +303,8 @@ class GlmEngine:
         store = self._store()
         if store is not None:
             self._bell = getattr(self, "_bell", 0) + 1
-            store.set(f"tf_glm_request_{self._bell}", b"1")
+            for peer in range(1, self.world):
+                store.set(f"tf_glm_request_{self._bell}/{peer}", b"1")
 
     def _await_bell(self) -> None:
         store = self._store()
@@ -308,7 +312,7 @@ class GlmEngine:
             return
         from datetime import timedelta
 
-        key = f"tf_glm_request_{getattr(self, '_bell', 0) + 1}"
+        key = f"tf_glm_request_{getattr(self, '_bell', 0) + 1}/{self.rank}"
         while True:
             try:
                 store.wait([key], timedelta(hours=1))
@@ -324,12 +328,12 @@ class GlmEngine:
 
         torch = self.torch
         n = torch.tensor([len(values) if self.rank == 0 else 0], dtype=torch.int32, device="cuda")
-        got = torch.empty((2,), dtype=torch.int32, device="cuda")
+        got = torch.empty((self.world,), dtype=torch.int32, device="cuda")
         self.comm.all_gather(n, got)
         count = int(got[0].item())
         buf = (torch.tensor(values, dtype=torch.int32, device="cuda") if self.rank == 0
                else torch.zeros((count,), dtype=torch.int32, device="cuda"))
-        allv = torch.empty((2 * count,), dtype=torch.int32, device="cuda")
+        allv = torch.empty((self.world * count,), dtype=torch.int32, device="cuda")
         self.comm.all_gather(buf, allv)
         return [int(v) for v in allv[:count].tolist()]
 
@@ -550,10 +554,10 @@ class GlmEngine:
     def _gather_floats(self, values: list[float]) -> list[list[float]]:
         torch = self.torch
         mine = torch.tensor(values, dtype=torch.float32, device="cuda")
-        got = torch.empty((2 * len(values),), dtype=torch.float32, device="cuda")
+        got = torch.empty((self.world * len(values),), dtype=torch.float32, device="cuda")
         self.comm.all_gather(mine, got)
         width = len(values)
-        return [[float(item) for item in got[:width].tolist()], [float(item) for item in got[width:].tolist()]]
+        return got.view(self.world, width).tolist()
 
     def follow(self) -> None:
         """Rank 1: mirror every request rank 0 serves, forever."""

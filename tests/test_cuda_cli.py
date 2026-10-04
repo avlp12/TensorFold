@@ -400,3 +400,63 @@ def test_vision_offload_is_a_cuda_option_that_needs_vision(tmp_path, flags, back
     family = SimpleNamespace(title=qwen3_5.TITLE, package=qwen3_5, model_type="qwen3_5")
     with pytest.raises(ValueError, match=message):
         cli._check_serve_options(args, family, backend)
+
+
+def test_flash_tp4_cli_and_family_guard(tmp_path):
+    args = cli.build_parser().parse_args([
+        'serve', str(tmp_path), '--backend', 'cuda', '--tp', '4', '--rank', '3',
+        '--master', '192.0.2.11', '--no-drafts', '--no-update-check',
+    ])
+    assert (args.tp, args.rank) == (4, 3)
+    with pytest.raises(ValueError, match='does not support'):
+        cli._serve_cuda(args, _family(cuda_engine=lambda *a, **k: None), tmp_path)
+    args.rank = 4
+    with pytest.raises(ValueError, match='rank must'):
+        cli._serve_cuda(args, _family(CUDA_TP=(2, 4), cuda_engine=lambda *a, **k: None), tmp_path)
+
+
+def test_declared_tp4_reaches_engine_with_all_four_rank_options(tmp_path):
+    seen = {}
+    def engine(path, **options):
+        seen.update(options)
+        raise RuntimeError('engine reached without loading')
+    args = cli.build_parser().parse_args([
+        'serve', str(tmp_path), '--backend', 'cuda', '--tp', '4', '--rank', '3',
+        '--master', '192.0.2.11', '--no-drafts', '--no-update-check',
+    ])
+    family = _family(CUDA_TP=(2, 4), cuda_engine=engine)
+    family.model_type = "glm5_next"
+    with pytest.raises(RuntimeError, match='engine reached'):
+        cli._serve_cuda(args, family, tmp_path)
+    assert (seen['tp'], seen['rank']) == (4, 3)
+
+
+def test_unsupported_tp4_is_rejected_before_resolving_weights(tmp_path, monkeypatch):
+    from tensorfold import families, hub
+    family = _family(cuda_engine=lambda *a, **k: None)
+    monkeypatch.setattr(cli, '_config_dir', lambda model: tmp_path)
+    monkeypatch.setattr(families, 'detect', lambda path: family)
+    def unexpected(*args, **kwargs):
+        raise AssertionError('weights were resolved before topology validation')
+    monkeypatch.setattr(hub, 'resolve', unexpected)
+    args = cli.build_parser().parse_args([
+        'serve', 'owner/model', '--backend', 'cuda', '--tp', '4',
+        '--master', '192.0.2.11', '--no-update-check',
+    ])
+    with pytest.raises(ValueError, match='does not support'):
+        cli.cmd_serve(args)
+
+
+@pytest.mark.parametrize('rank', [1, 2, 3])
+def test_every_tp4_worker_follows_instead_of_binding_http(tmp_path, monkeypatch, rank):
+    calls = []
+    engine = SimpleNamespace(follow=lambda: calls.append(rank))
+    family = _family(CUDA_TP=(2, 4), cuda_engine=lambda *a, **k: engine)
+    family.model_type = 'glm5_next'
+    monkeypatch.setattr(cli.stacks, 'arm', lambda: None)
+    args = cli.build_parser().parse_args([
+        'serve', str(tmp_path), '--backend', 'cuda', '--tp', '4', '--rank', str(rank),
+        '--master', '192.0.2.11', '--no-drafts', '--no-update-check',
+    ])
+    assert cli._serve_cuda(args, family, tmp_path) == 0
+    assert calls == [rank]

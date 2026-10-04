@@ -237,15 +237,26 @@ def _backend(choice: str, family: Any) -> str:
     return backend
 
 
+def _check_cuda_topology(args: argparse.Namespace, family: Any) -> None:
+    """Reject a topology the model cannot load before resolving its weights."""
+
+    if args.tp > 1 and not args.master:
+        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
+    if args.tp == 1 and args.rank != 0:
+        raise ValueError("--rank 1 needs --tp 2")
+    allowed = getattr(family.package, "CUDA_TP", (1, 2))
+    if args.tp not in allowed:
+        raise ValueError(f"{family.title} does not support --tp {args.tp}; supported: {allowed}")
+    if not 0 <= args.rank < args.tp:
+        raise ValueError("rank must be in [0, tp)")
+
+
 def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context: int | None = None) -> int:
     """Serve with the family's CUDA engine (``cuda_engine``) behind ``tensorfold.cuda.server``."""
 
     from tensorfold import hub
 
-    if args.tp == 2 and not args.master:
-        raise ValueError("--tp 2 needs --master: rank 0's address on the link between the two machines")
-    if args.tp == 1 and args.rank != 0:
-        raise ValueError("--rank 1 needs --tp 2")
+    _check_cuda_topology(args, family)
     started = time.perf_counter()
     drafter = "" if args.no_drafts else _drafter(family, args.drafter, "cuda")
     options: dict[str, Any] = {"drafter": drafter, "tp": int(args.tp), "rank": int(args.rank), "master": args.master,
@@ -269,7 +280,7 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
     if getattr(args, "checkpoint_slots", None) is not None and getattr(family.package, "CUDA_CHECKPOINT_SLOTS", False):
         options["checkpoint_slots"] = int(args.checkpoint_slots)
     served = args.name or (args.model.rstrip("/").split("/")[-1] if hub.is_repo_id(args.model) else model_dir.name)
-    where = f", rank {args.rank} of 2" if args.tp == 2 else ""
+    where = f", rank {args.rank} of {args.tp}" if args.tp > 1 else ""
     print(f"[tensorfold] loading {served}: {family.title} ({family.model_type}) on CUDA{where}", flush=True)
     from tensorfold.cuda import precision, prompt_precision
 
@@ -287,8 +298,8 @@ def _serve_cuda(args: argparse.Namespace, family: Any, model_dir: Path, context:
         raise ValueError("--prefill-fp8: this checkpoint's prompt matmuls have no FP8 kernel (EXL3 packs, MLX formats "
                          "other than Qwen's 4-bit g64, Flash Next without MXFP8 layers); drop the flag")
     stacks.arm()            # its warmup may have loaded a compiler that took USR1
-    if args.tp == 2 and args.rank == 1:
-        print(f"[tensorfold] rank 1 ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
+    if args.tp > 1 and args.rank > 0:
+        print(f"[tensorfold] rank {args.rank} ready in {time.perf_counter() - started:.1f}s, following rank 0", flush=True)
         engine.follow()
         return 0
     from tensorfold.cuda.server import App, serve
@@ -360,6 +371,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
         raise ValueError(f"--ple-on-ssd: {family.title} has no n-gram (PLE) tables to read from SSD")
     backend = _backend(args.backend, family)
     _check_serve_options(args, family, backend, config_dir)
+    if backend == "cuda":
+        _check_cuda_topology(args, family)
     families.require_readable(family, families.read_config(config_dir), backend)
     _note_untested(family, args.model)
     required_files = getattr(family.package, "REQUIRED_FILES", {}).get(args.model, ())

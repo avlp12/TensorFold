@@ -71,51 +71,58 @@ def read_header(path: str | Path) -> tuple[dict, int]:
     return header, 8 + n
 
 
-def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int) -> tuple[np.ndarray, list[int]]:
+def validate_topology(rank: int, world: int) -> None:
+    if world not in (2, 4) or not 0 <= rank < world:
+        raise ValueError(f"invalid Flash topology: rank={rank}, world={world}")
+
+
+def split_bytes(raw: np.ndarray, shape: list[int], itemsize: int, kind: str, rank: int, world: int = 2) -> tuple[np.ndarray, list[int]]:
     """A tensor's bytes -> rank's part of them and its shape."""
 
+    validate_topology(rank, world)
     if kind == "rep":
         return raw, list(shape)
     if kind == "row":
         rows = shape[0]
-        if rows % 2:
+        if rows % world:
             raise ValueError(f"row split of odd leading dim {shape}")
         per = raw.size // rows
-        half = rows // 2
+        half = rows // world
         return raw[rank * half * per:(rank + 1) * half * per], [half] + list(shape[1:])
     if kind == "col":
-        if len(shape) != 2 or shape[1] % 2:
+        if len(shape) != 2 or shape[1] % world:
             raise ValueError(f"column split needs an even 2-D shape, got {shape}")
         view = raw.reshape(shape[0], shape[1] * itemsize)
-        half = shape[1] // 2
+        half = shape[1] // world
         part = np.ascontiguousarray(view[:, rank * half * itemsize:(rank + 1) * half * itemsize])
         return part.reshape(-1), [shape[0], half]
     if kind == "dim1":                                   # the second axis of a 2-D or higher tensor
-        if len(shape) < 2 or shape[1] % 2:
+        if len(shape) < 2 or shape[1] % world:
             raise ValueError(f"split of the second axis needs an even second dim, got {shape}")
         inner = int(np.prod(shape[2:])) * itemsize
         view = raw.reshape(shape[0], shape[1] * inner)
-        half = shape[1] // 2
+        half = shape[1] // world
         part = np.ascontiguousarray(view[:, rank * half * inner:(rank + 1) * half * inner])
         return part.reshape(-1), [shape[0], half] + list(shape[2:])
     raise ValueError(kind)
 
 
-def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int):
+def split_device(raw, shape: list[int], itemsize: int, kind: str, rank: int, world: int = 2):
     """``split_bytes`` for a uint8 tensor on the GPU: the rank's part (a new contiguous tensor) and its shape."""
 
+    validate_topology(rank, world)
     if kind == "rep":
         return raw.clone(), list(shape)
     if kind == "row":
-        if shape[0] % 2:
+        if shape[0] % world:
             raise ValueError(f"row split of odd leading dim {shape}")
-        per, half = raw.numel() // shape[0], shape[0] // 2
+        per, half = raw.numel() // shape[0], shape[0] // world
         return raw[rank * half * per:(rank + 1) * half * per].clone(), [half] + list(shape[1:])
     if kind in ("col", "dim1"):
-        if len(shape) < 2 or shape[1] % 2 or (kind == "col" and len(shape) != 2):
+        if len(shape) < 2 or shape[1] % world or (kind == "col" and len(shape) != 2):
             raise ValueError(f"{kind} split needs an even second dim, got {shape}")
         inner = int(np.prod(shape[2:])) * itemsize
-        half = shape[1] // 2
+        half = shape[1] // world
         part = raw.view(shape[0], shape[1] * inner)[:, rank * half * inner:(rank + 1) * half * inner]
         return part.contiguous().reshape(-1), [shape[0], half] + list(shape[2:])
     raise ValueError(kind)
@@ -136,10 +143,13 @@ def rank_files(model_dir: str | Path, rank: int) -> list[Path]:
 class RankReader:
     """Read stored-dtype CPU tensors for one rank from the full checkpoint or its pre-split folder."""
 
-    def __init__(self, model_dir: str | Path, rank: int) -> None:
+    def __init__(self, model_dir: str | Path, rank: int, world: int = 2) -> None:
         from tensorfold.cuda.direct_read import ReadAhead, Reader, SafeTensors
 
-        self.dir, self.rank = Path(model_dir), rank
+        validate_topology(rank, world)
+        self.dir, self.rank, self.world = Path(model_dir), rank, world
+        if world == 4 and any(self.dir.glob("*.rank*.safetensors")):
+            raise ValueError("Flash TP4 requires the full checkpoint; TP2 rank folders are incompatible")
         self.io = Reader()                                # O_DIRECT reads where the file system allows them
         self.reads = ReadAhead(self.io, READERS, RUN, GAP)
         mine, other = rank_files(self.dir, rank), rank_files(self.dir, 1 - rank)
@@ -196,9 +206,9 @@ class RankReader:
             raise KeyError(f"{name} is not used by the engine")
         a, b = info["data_offsets"]
         shape = list(info["shape"])
-        if kind == "row" and shape and shape[0] % 2 == 0:   # the rank's rows are one run: read only those
-            per = (b - a) // shape[0] * (shape[0] // 2)
-            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // 2] + shape[1:]
+        if kind == "row" and shape and shape[0] % self.world == 0:   # the rank's rows are one run: read only those
+            per = (b - a) // shape[0] * (shape[0] // self.world)
+            a, b, kind, shape = a + self.rank * per, a + (self.rank + 1) * per, "rep", [shape[0] // self.world] + shape[1:]
         return file, base + a, base + b, kind, shape, info["dtype"]
 
     def _tensor(self, raw: np.ndarray, span: tuple, own: bool):
@@ -207,7 +217,7 @@ class RankReader:
         import torch
 
         _, _, _, kind, shape, dtype = span
-        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+        data, shape = split_bytes(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, self.world)
         if own and np.may_share_memory(data, raw):
             data = data.copy()
         return torch.from_numpy(data).view(torch_dtype(dtype)).reshape(shape)
@@ -224,7 +234,7 @@ class RankReader:
         if not raw.is_cuda:
             return self._tensor(raw.numpy(), span, own=True)
         _, _, _, kind, shape, dtype = span
-        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank)
+        data, shape = split_device(raw, shape, DTYPE_BYTES[dtype], kind, self.rank, self.world)
         return data.view(torch_dtype(dtype)).reshape(shape)
 
 def write(path: str, tensors: list[tuple[str, str, list[int], np.ndarray]], metadata: dict | None) -> None:
