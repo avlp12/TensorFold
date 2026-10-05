@@ -20,9 +20,9 @@ class Indexer(unittest.TestCase):
   for x in [torch.zeros(1,16,132),torch.zeros(1,16,128,dtype=torch.uint8),torch.zeros(0,16,132,dtype=torch.uint8),torch.zeros(1,32,132,dtype=torch.uint8)[:,::2]]:
    with self.assertRaises(ValueError):i.page_rows(x)
  def test_query_metadata_and_dtype_not_silently_converted(self):
-  q=torch.zeros(2,16,128,dtype=torch.bfloat16);w=torch.zeros(2,16,dtype=torch.bfloat16);error=torch.zeros((),dtype=torch.bool)
+  q=torch.zeros(2,32,128,dtype=torch.bfloat16);w=torch.zeros(2,32,dtype=torch.bfloat16);error=torch.zeros((),dtype=torch.bool)
   i.validate_query(q,w,error)
-  for badq,badw in [(q.float(),w),(q[:,:8],w[:,:8]),(q,w.float()),(q,w[:1])]:
+  for badq,badw in [(q.float(),w),(q[:,:16],w[:,:16]),(q,w.float()),(q,w[:1])]:
    with self.assertRaises(ValueError):i.validate_query(badq,badw,error)
  def test_pool_precision_contract(self):
   k=torch.zeros(3,4,128,dtype=torch.bfloat16);g=k.clone();ape=torch.zeros(4,128,dtype=torch.float32);error=torch.zeros((),dtype=torch.bool)

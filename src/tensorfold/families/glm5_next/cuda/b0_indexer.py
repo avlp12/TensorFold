@@ -8,7 +8,7 @@ pages into canonical rows without extracting both regions.
 import torch
 
 WIDTH = 128
-HEADS = 16
+HEADS = 32  # actual target config rev25a44; do not infer from older source comments
 ROW_BYTES = 132
 
 
@@ -25,14 +25,14 @@ def _error(error, device):
 
 def validate_query(q, weights, error):
     if q.ndim != 3 or q.shape[0] == 0 or q.shape[1:] != (HEADS, WIDTH) or q.dtype != torch.bfloat16:
-        raise ValueError('B0 index queries must be BF16 [rows,16,128]')
+        raise ValueError('B0 index queries must be BF16 [rows,32,128]')
     if weights.shape != q.shape[:2] or weights.dtype != torch.bfloat16 or weights.device != q.device:
         raise ValueError('original BF16 head weights must match query rows/heads')
     _error(error, q.device)
 
 
 def query(q, weights, error):
-    """Original FWHT/FP8 query with exact B0 scale-folding order and zero heads."""
+    """Original FWHT/FP8 query with B0 scale folding for target index_n_heads=32."""
     validate_query(q, weights, error)
     if q.device.type != 'cuda':
         raise ValueError('query quantization requires CUDA')
@@ -46,8 +46,6 @@ def query(q, weights, error):
     codes = codes.view(q.shape)
     scales = scales.view(q.shape[0], HEADS, 1)
     folded = (clean_w.unsqueeze(-1) * scales * (WIDTH ** -0.5 * HEADS ** -0.5)).squeeze(-1)
-    codes = torch.cat((codes, codes.new_zeros((q.shape[0], 32 - HEADS, WIDTH))), dim=1)
-    folded = torch.cat((folded, folded.new_zeros((q.shape[0], 32 - HEADS))), dim=1)
     return codes, folded
 
 
