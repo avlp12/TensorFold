@@ -71,6 +71,11 @@ class Startup(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'empty pool'):
             c.b0_home_claim(32)
 
+    def test_pool_rounding_preserves_requested_context(self):
+        for cap, spare, want in [(850016,0,851968),(2048,0,2048),(2049,0,4096),(850016,4096,854016)]:
+            self.assertEqual(p.aligned_pool_rows(cap,spare,2048),want)
+            self.assertGreaterEqual(want,cap)
+
     def test_default_cache_home_hooks_remain_noops(self):
         c = f.Caches(f.weights(indexed=False), 32)
         c.b0_home_claim(32); c.b0_home_reset(32); c.b0_home_release()

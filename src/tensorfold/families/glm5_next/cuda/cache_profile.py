@@ -59,3 +59,10 @@ def cache_scope(salt):
     import hashlib
     import struct
     return tuple(struct.unpack('<8i', hashlib.sha256(salt.encode('utf-8')).digest()))
+
+
+def aligned_pool_rows(capacity, spare_rows, alignment):
+    if capacity <= 0 or spare_rows < 0 or alignment <= 0:
+        raise ValueError('positive capacity/alignment and nonnegative spare rows required')
+    minimum = -(-capacity // alignment) * alignment
+    return max(minimum, (capacity + spare_rows) // alignment * alignment)

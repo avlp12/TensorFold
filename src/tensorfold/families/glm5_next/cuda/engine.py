@@ -627,6 +627,13 @@ class GlmEngine:
                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
                              prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", **self.cache_profile.options(),
                              decode_rows=multi_decode_rows(parallel, self.multi_window))
+            if parallel > 1:
+                from .pool import ALIGN
+                raw_geometry = g
+                # Admission must budget the allocator's whole extents, including
+                # the final partially occupied one. Never reduce requested context.
+                g = Geometry(lambda slots: raw_geometry.bytes_at(-(-slots // ALIGN) * ALIGN),
+                             raw_geometry.reserve, raw_geometry.minimum_slots)
             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
             # verify window's buffers (TF_GLM_MULTI_WINDOW rows) beside the engine's own fit the decode rows the
             # estimate sizes (``multi_decode_rows``), its token selection's fp32 scores (window rows x a pool of 4
@@ -723,12 +730,14 @@ class GlmEngine:
                                                                           (22 << 20))
             # TF_GLM_DISPLAY_KV_MIB: the display reservation's bytes too, which free memory never counted
             display = display_kv.credit()
-            pool_rows = (capacity + max(0, self.cache_bytes + display - states) // per_token) // ALIGN * ALIGN
+            from .cache_profile import aligned_pool_rows
+            pool_rows = aligned_pool_rows(capacity, max(0, self.cache_bytes + display - states) // per_token, ALIGN)
             display_rows = pool_rows - (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
             if pool_rows < ALIGN:
                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
                                  f"extent; free memory or lower --context")
-            self.limit = min(self.limit, pool_rows - MAX_ROWS)
+            if pool_rows - MAX_ROWS < self.limit:
+                raise ValueError("allocated pool cannot preserve the requested per-request context")
             self.cache_bytes = 0                 # kept prompts live in the pool
             plan["pool_tokens"] = pool_rows
         if rank == 0 and self.cache_bytes < wanted and parallel == 1:
@@ -794,10 +803,10 @@ class GlmEngine:
         if rank == 0 and self.dump is not None:
             print(f"[tensorfold] TF_GLM_DRAFT_DUMP: DFlash2 requests decode serially and record the drafter's view "
                   f"into {self.dump} (one .npz a request; replies equal draft: false)", flush=True)
-        if rank == 0 and kv != "bf16":
+        if rank == 0 and kv != "bf16" and self.cache_profile.indexer != "b0":
             print("[tensorfold] TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows with a "
                   "power-of-two scale each (lossy; drafted replies still equal serial ones)", flush=True)
-        if rank == 0 and quant_code:
+        if rank == 0 and quant_code and not draft_bf16:
             print("[tensorfold] TF_GLM_DRAFT_QUANT=mse: DFlash2's 4-bit copies (and an EXL3 draft head) with "
                   "least-squares clipped ranges", flush=True)
         if rank == 0 and self.grid:
