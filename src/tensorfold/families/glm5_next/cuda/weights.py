@@ -280,7 +280,8 @@ class Weights:
         return total
 
 
-def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cuda", mtp: bool = True) -> Weights:
+def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cuda", mtp: bool = True,
+         indexer: str = "vendor") -> Weights:
     """Rank ``rank`` of ``world`` from a checkpoint or rank folder (``tp.Layout``'s shares), MTP included unless
     ``mtp`` is False, with its rows of the head."""
 
@@ -292,6 +293,8 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
+    from .b0_indexer import ape_dtype
+    index_ape_dtype = ape_dtype(indexer)
     dev = torch.device(device)
     rd = RankReader(model_dir, rank, world)
     HL = lay.heads
@@ -366,7 +369,7 @@ def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cud
         ix = IndexW(stack([p + "indexer.wk", p + "indexer.weights_proj"]), q4(p + "indexer.wq_b"),
                     t(p + "indexer.k_norm.weight"), t(p + "indexer.k_norm.bias"),
                     t(p + "indexer.index_kpool_compress_gate", torch.bfloat16).contiguous(),
-                    t(p + "indexer.index_kpool_compress_ape", torch.bfloat16).contiguous())
+                    t(p + "indexer.index_kpool_compress_ape", index_ape_dtype).contiguous())
         return DSAW(proj, t(p + "q_a_layernorm.weight"), t(p + "kv_a_layernorm.weight"), q4(p + "q_b_proj"),
                     kv_k, kv_v, q4(p + "o_proj"), HL, ix, absorb)
 
