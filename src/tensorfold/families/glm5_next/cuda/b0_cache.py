@@ -33,16 +33,21 @@ class PackedCachePool:
         self._extents = {}
         self._generation = 0
 
-    def reserve(self, owner: str, base: int, capacity: int) -> Extent:
-        """Host-side slot lifecycle; call outside graphs with no in-flight users."""
+    def _placement(self, owner, base, capacity, *, replacing=None):
         if self.storage.is_cuda and torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("cannot reserve cache extents during capture")
-        if not isinstance(owner, str) or not owner or owner in self._extents:
-            raise ValueError("unique nonempty owner required")
+            raise RuntimeError("cannot change cache extents during capture")
+        if not isinstance(owner, str) or not owner:
+            raise ValueError("nonempty owner required")
+        if owner in self._extents and self._extents[owner] is not replacing:
+            raise ValueError("duplicate owner")
         if type(base) is not int or type(capacity) is not int or base < 0 or capacity <= 0 or base + capacity > self.rows:
             raise ValueError("extent outside pool")
-        if any(base < e.base + e.capacity and e.base < base + capacity for e in self._extents.values()):
+        if any(e is not replacing and base < e.base + e.capacity and e.base < base + capacity for e in self._extents.values()):
             raise ValueError("overlapping cache extents")
+
+    def reserve(self, owner: str, base: int, capacity: int) -> Extent:
+        """Host-side slot lifecycle; call outside graphs with no in-flight users."""
+        self._placement(owner, base, capacity)
         self._generation += 1
         extent = Extent(owner, base, capacity, self._generation)
         self._extents[owner] = extent
@@ -61,6 +66,33 @@ class PackedCachePool:
         self.valid[extent.base:extent.base + extent.capacity].zero_()
         self.generations[extent.base:extent.base + extent.capacity].zero_()
         del self._extents[extent.owner]
+
+    def validate_rebind(self, extent, base, capacity, used):
+        self._owned(extent)
+        self._placement(extent.owner, base, capacity, replacing=extent)
+        if type(used) is not int or used < 0 or used > min(extent.capacity, capacity):
+            raise ValueError("retained rows outside old or new extent")
+
+    def rebind(self, extent, base, capacity, used):
+        """Renew ownership AFTER the caller copies payload+validity to base.
+
+        Never copy generation identities. The retained destination prefix keeps
+        its validity; all other old rows and the new tail become unreadable.
+        The caller must retire old graphs and quiesce all users before mutation.
+        """
+        self.validate_rebind(extent, base, capacity, used)
+        old_end = extent.base + extent.capacity
+        if base > extent.base:
+            self.valid[extent.base:min(old_end, base)].zero_()
+        if base + used < old_end:
+            self.valid[max(extent.base, base + used):old_end].zero_()
+        self.valid[base + used:base + capacity].zero_()
+        self.generations[extent.base:old_end].zero_()
+        self._generation += 1
+        fresh = Extent(extent.owner, base, capacity, self._generation)
+        self.generations[base:base + capacity].fill_(fresh.generation)
+        self._extents[extent.owner] = fresh
+        return fresh
 
     def _indices(self, indices, ndim):
         if indices.ndim != ndim or indices.dtype != torch.int64 or not indices.is_contiguous() or indices.device != self.storage.device:

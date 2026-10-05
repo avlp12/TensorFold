@@ -850,8 +850,11 @@ class MultiDecoder:
                                    f"rank 0 said [{a['base']}, {a['base'] + a['size']})")
         else:
             x = self.pool.add(a["base"], a["size"])
+            e.caches.b0_claim(x.eid, x.base, x.size)
             if hit is not None:
                 self.arena.copy(hit.extent.base, x.base, cut)
+        if hit is not None and not a["copy"]:
+            e.caches.b0_claim(x.eid, x.base, x.size, used=cut)
         x.owner = a["sid"]
         st = State(self.w, x.size, e.rows, caches=e.caches, base=x.base, slots=e.slots, slot=a["slot"])
         code = a["code"]
@@ -966,11 +969,12 @@ class MultiDecoder:
         if x.owner is not None:
             return
         if not x.kept:
+            self.e.caches.b0_release(x.eid)
             self.pool.remove(x)
             return
         size = align_up(max(len(k.ids) for k in x.kept))
         if size < x.size:
-            self.pool.resize(x, size)
+            self._resize(x, size)
 
     def _evict(self, c) -> None:
         """Rank 0: drop a kept prompt on both ranks."""
@@ -991,13 +995,20 @@ class MultiDecoder:
         """Both ranks: relocate extent x (its used rows copied) to [base, base + size)."""
 
         used = self._used(x)
+        self.e.caches.b0_validate_reframe(x.eid, base, size, used=used, move=True)
         old = self.pool.move(x, base, size)
-        self.arena.copy(old, base, used)
+        if self.e.caches.b0_pools:
+            self.e.caches.b0_reframe(x.eid, base, size, used=used, move=True)
+        else:
+            self.arena.copy(old, base, used)
         if x.owner is not None:
             self.lanes[x.owner].st.bind(x.base, x.size)
 
     def _resize(self, x, size: int) -> None:
+        used = self._used(x)
+        self.e.caches.b0_validate_reframe(x.eid, x.base, size, used=used)
         self.pool.resize(x, size)
+        self.e.caches.b0_reframe(x.eid, x.base, size, used=used)
         if x.owner is not None:
             self.lanes[x.owner].st.bind(x.base, x.size)
 

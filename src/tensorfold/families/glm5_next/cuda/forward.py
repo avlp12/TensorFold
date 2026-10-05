@@ -209,6 +209,8 @@ class Caches:
             raise ValueError("quantized MLA rows need the latent cache")
         if self.latent_kv == "b0_fp8" and display:
             raise ValueError("B0 packed cache display allocation is not integrated")
+        self.b0_bindings = {}
+        self.b0_epoch = 0
         self.b0_pools = []
         self.b0_valid_planes = []
         planes: list[Plane] = []
@@ -289,6 +291,56 @@ class Caches:
 
     def ring_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for pair in (self.rings or []) for t in pair)
+
+    def b0_claim(self, key, base, size, *, used=0):
+        """Renew one arena extent for an admitted stream, retaining a prefix."""
+        if not self.b0_pools:
+            return
+        if key in self.b0_bindings:
+            return self.b0_reframe(key, base, size, used=used)
+        owner = str(key)
+        if used != 0:
+            raise ValueError("new B0 claims cannot claim resident rows before a copy")
+        for pool in self.b0_pools:
+            pool._placement(owner, base, size)
+        self.b0_bindings[key] = [pool.reserve(owner, base, size) for pool in self.b0_pools]
+        self.b0_epoch += 1
+
+    def b0_validate_reframe(self, key, base, size, *, used, move=False):
+        if not self.b0_pools:
+            return
+        old = self.b0_bindings[key]
+        for pool, extent in zip(self.b0_pools, old, strict=True):
+            pool.validate_rebind(extent, base, size, used)
+        if not move and base != old[0].base:
+            raise ValueError("changing B0 base requires payload relocation")
+
+    def b0_reframe(self, key, base, size, *, used, move=False):
+        if not self.b0_pools:
+            return
+        self.b0_validate_reframe(key, base, size, used=used, move=move)
+        old = self.b0_bindings[key]
+        try:
+            if move:
+                self.arena.copy(old[0].base, base, used)
+            self.b0_bindings[key] = [pool.rebind(extent, base, size, used)
+                                    for pool, extent in zip(self.b0_pools, old, strict=True)]
+        except BaseException:
+            for pool in self.b0_pools:
+                pool.error.fill_(True)
+            raise
+        self.b0_epoch += 1
+
+    def b0_release(self, key):
+        if not self.b0_pools:
+            return
+        old = self.b0_bindings[key]
+        for pool, extent in zip(self.b0_pools, old, strict=True):
+            pool._owned(extent)
+        for pool, extent in zip(self.b0_pools, old, strict=True):
+            pool.release(extent)
+        del self.b0_bindings[key]
+        self.b0_epoch += 1
 
     def b0_auxiliary_bytes(self) -> int:
         """Bytes not exposed as arena rows: generations, sink rows and error flags."""
