@@ -38,13 +38,13 @@ def parse_numbers(fields: dict[str, Any]) -> dict[str, Any]:
     return parsed
 
 
-EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
+EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
 
 
 def effort_levels(template: str | None) -> frozenset[str]:
-    """The efforts a chat template names: Qwen3.8's low, medium and xhigh; GLM-5.3's low and high."""
+    """The efforts a chat template names: Qwen3.8's low, medium and xhigh; GLM-5.3's low, high and max."""
 
-    return frozenset(re.findall(r"""['"](minimal|low|medium|high|xhigh)['"]""", template or ""))
+    return frozenset(re.findall(r"""['"](minimal|low|medium|high|xhigh|max)['"]""", template or ""))
 
 
 def coerce_effort(effort: str | None, levels: frozenset[str] = frozenset()) -> str | None:
@@ -52,11 +52,12 @@ def coerce_effort(effort: str | None, levels: frozenset[str] = frozenset()) -> s
 
     if effort is None:
         return None
-    # OpenAI's "high" and "minimal" are "xhigh" and "low" unless the template names them (GLM-5.3 names "high")
-    if effort in levels or effort not in ("high", "minimal"):
+    # OpenAI's "high" and "minimal" are "xhigh" and "low" unless the template names them (GLM-5.3 names "high"),
+    # and "max" is the template's own top level where it names one (GLM-5.3's default), else "xhigh"
+    if effort in levels or effort not in ("high", "minimal", "max"):
         chosen = effort
     else:
-        chosen = "xhigh" if effort == "high" else "low"
+        chosen = {"high": "xhigh", "minimal": "low", "max": "xhigh"}[effort]
     # GLM lists high and leaves medium unnamed. medium is that high. xhigh stays xhigh, and the template renders Max.
     if chosen == "medium" and "high" in levels and "medium" not in levels:
         return "high"
@@ -69,17 +70,44 @@ def heard_effort(explicit: str | None, default: str | None, levels: frozenset[st
     return coerce_effort(default if explicit is None else explicit, levels)
 
 
+_IGNORED_THINKING: set[str] = set()     # the kinds of unread ``thinking`` values already logged (once each)
+
+
+def thinking_switch(value: Any) -> bool | None:
+    """``chat_template_kwargs.thinking`` as ``enable_thinking``: true / false, or Anthropic's and DeepSeek's
+    ``{"type": "enabled" | "disabled"}``. Null, and any other value (``{"type": "adaptive"}``, a string ...), is
+    unset: the server's default, never a refusal (logged once a kind)."""
+
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    kind = value.get("type") if isinstance(value, dict) else None
+    if kind in ("enabled", "disabled"):
+        return kind == "enabled"
+    shown = f"{{'type': {kind!r}}}" if isinstance(value, dict) else type(value).__name__
+    if shown not in _IGNORED_THINKING and len(_IGNORED_THINKING) < 64:
+        _IGNORED_THINKING.add(shown)
+        print(f"[tensorfold] chat_template_kwargs.thinking {shown[:80]}: not true, false or "
+              f'{{"type": "enabled" | "disabled"}}; the server\'s default applies (logged once)', flush=True)
+    return None
+
+
 def thinking_fields(body: dict[str, Any], levels: frozenset[str] = frozenset()) -> dict[str, Any]:
     """A request's ``reasoning_effort`` and ``enable_thinking`` where it sets them; unset is the server's default."""
 
     kwargs = body.get("chat_template_kwargs") or {}
+    if isinstance(kwargs, dict) and "thinking" in kwargs and "enable_thinking" not in kwargs:
+        switch = thinking_switch(kwargs["thinking"])      # the switch DeepSeek-V4 clients (pi) send
+        if switch is not None:
+            kwargs = {**kwargs, "enable_thinking": switch}
     fields: dict[str, Any] = {}
     effort = body.get("reasoning_effort")
     if effort is None and isinstance(kwargs, dict):
         effort = kwargs.get("reasoning_effort")           # where vLLM's clients put it
     if effort is not None:
         if not isinstance(effort, str) or effort not in EFFORTS:
-            raise RequestError("reasoning_effort must be none, minimal, low, medium, high or xhigh")
+            raise RequestError("reasoning_effort must be none, minimal, low, medium, high, xhigh or max")
         fields["reasoning_effort"] = coerce_effort(effort, levels)
         fields["enable_thinking"] = effort != "none"
     if isinstance(kwargs, dict) and "enable_thinking" in kwargs:          # an explicit switch wins

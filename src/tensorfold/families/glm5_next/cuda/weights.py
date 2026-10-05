@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +15,31 @@ from tensorfold.cuda import experts as grouped
 
 from .exl3_mm import Exl3Experts, words as exl3_words
 from . import latent
-from .qmm import B16, Q4, as_i32, make_b16, make_q4, quantize4, stack_b16, stack_q4
+from .qmm import (B16, F8, Q4, as_i32, dense_kind, draft_quant, draft_quantize4, kvb_kind, make_b16, make_f8, make_q4, stack_b16,
+                  stack_f8, stack_q4)
 
 PREFIX = "model.language_model."
+
+
+@lru_cache(maxsize=None)
+def assistant_end(model_dir: str) -> int | None:
+    """The id of GLM's ``<|assistant|>`` role token when it ends a reply (TF_GLM_ASSISTANT_ENDS, default 1; 0: it
+    doesn't), or None without one in the checkpoint's tokenizer. The checkpoint's end tokens are ``<|endoftext|>``,
+    ``<|user|>`` and ``<|observation|>``; at high reasoning effort the model sometimes writes ``<|assistant|>``
+    inside its answer and starts a second one, which reached the client with the token in its text (issue #60). A new
+    assistant turn inside an assistant turn ends it: the reply stops there, as at the other role tokens."""
+
+    on = (os.environ.get("TF_GLM_ASSISTANT_ENDS", "") or "1").strip()
+    if on not in ("0", "1"):
+        raise ValueError(f"TF_GLM_ASSISTANT_ENDS: 0 or 1, not {on!r}")
+    path = Path(model_dir) / "tokenizer.json"
+    if on == "0" or not path.is_file():
+        return None
+    try:
+        added = json.loads(path.read_text()).get("added_tokens", [])
+    except (OSError, ValueError):
+        return None
+    return next((int(t["id"]) for t in added if t.get("content") == "<|assistant|>" and t.get("special")), None)
 
 
 @dataclass
@@ -69,6 +93,9 @@ class Config:
         quant = raw.get("quantization") or raw.get("quantization_config") or {}
         eos = t.get("eos_token_id", raw.get("eos_token_id"))
         eos = tuple(int(e) for e in eos) if isinstance(eos, list) else (int(eos),)
+        end = assistant_end(str(Path(model_dir)))
+        if end is not None and end not in eos:
+            eos += (end,)                     # issue #60: a new assistant turn ends the reply (TF_GLM_ASSISTANT_ENDS)
         n = int(t["num_hidden_layers"])
         kinds = ["kda" if k == "linear_attention" else "dsa" for k in t["layer_types"]]
         dense = int(t.get("first_k_dense_replace", 3))
@@ -152,12 +179,12 @@ class DSAW:
     q_norm: torch.Tensor
     kv_norm: torch.Tensor
     q_b: Q4
-    kv_k: Q4                  # key rows of kv_b for the local heads
-    kv_v: Q4                  # value rows
+    kv_k: Q4 | None           # key rows of kv_b for the local heads (TF_GLM_LATENT=0 only)
+    kv_v: Q4 | None           # value rows (TF_GLM_LATENT=0 only)
     o: Q4
     heads: int
     index: IndexW | None = None
-    absorb: object = None     # latent.AbsorbW: kv_b split per head, for attention on the latent cache
+    absorb: object = None     # latent.AbsorbW / AbsorbF8 / AbsorbQ4: kv_b split per head, for the latent cache
 
 
 @dataclass
@@ -204,18 +231,25 @@ class Weights:
     embed: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
     layers: list[LayerW]
     norm: torch.Tensor
-    head: Q4 | B16
+    head: Q4 | B16 | F8
     mtp: MTPW | None
     rank: int
     world: int
     device: torch.device
     comm: Any = None
     meta: dict = field(default_factory=dict)
-    draft_head: Q4 | None = None      # BF16 heads: a 4-bit copy the draft steps read (drafts only propose)
+    draft_head: Q4 | B16 | None = None  # None shares the original BF16 target head in BF16 draft mode.
+    tp: Any = None                    # the rank's ``tp.Layout`` (None: made from cfg, rank and world)
+
+    def __post_init__(self) -> None:
+        if self.tp is None:
+            from .tp import Layout
+
+            self.tp = Layout.from_config(self.cfg, self.rank, self.world)
 
     @property
     def vocab_offset(self) -> int:
-        return self.rank * (self.cfg.vocab // self.world)
+        return self.tp.vocab_offset
 
     def nbytes(self) -> int:
         total = 0
@@ -226,7 +260,8 @@ class Weights:
             if isinstance(t, torch.Tensor) and t.data_ptr() not in seen:
                 seen.add(t.data_ptr())
                 total += t.numel() * t.element_size()
-            elif isinstance(t, (Q4, B16, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW, IndexW)):
+            elif isinstance(t, (Q4, B16, F8, grouped.Experts, Exl3Experts, HCW, KDAW, DSAW, MLPW, MoEW, LayerW, MTPW,
+                                IndexW, latent.AbsorbW, latent.AbsorbQ4, latent.AbsorbF8)):
                 for v in vars(t).values():
                     add(v)
             elif isinstance(t, (list, tuple)):
@@ -245,20 +280,22 @@ class Weights:
         return total
 
 
-def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = True) -> Weights:
-    """One of two ranks from a checkpoint or rank folder, MTP included unless ``mtp`` is False, with its head half."""
+def load(model_dir: str | Path, *, rank: int, world: int = 2, device: str = "cuda", mtp: bool = True) -> Weights:
+    """Rank ``rank`` of ``world`` from a checkpoint or rank folder (``tp.Layout``'s shares), MTP included unless
+    ``mtp`` is False, with its rows of the head."""
 
     from .split import RankReader
+    from .tp import Layout
 
-    world = 2
     cfg = Config.read(model_dir)
+    lay = Layout.from_config(cfg, rank, world)
     if cfg.quant not in ("mlx", "exl3"):
         raise ValueError(f"GLM-5.3-Flash's CUDA engine reads MLX 4-bit or EXL3 checkpoints, not {cfg.quant}")
     exl3 = cfg.quant == "exl3"
     dev = torch.device(device)
-    rd = RankReader(model_dir, rank)
-    HL = cfg.heads // world
-    LL = cfg.lin_heads // world
+    rd = RankReader(model_dir, rank, world)
+    HL = lay.heads
+    LL = lay.lin_heads
 
     def t(name: str, dtype: torch.dtype | None = None) -> torch.Tensor:
         x = rd.get(PREFIX + name)
@@ -269,12 +306,24 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     def trip(name: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return (as_i32(t(name + ".weight")), t(name + ".scales"), t(name + ".biases"))
 
-    def q4(name: str) -> Q4 | B16:
-        return make_b16(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+    # TF_GLM_DENSE=fp8: the BF16 matrices as FP8 with block scales (lossy, half the bytes a decode round reads)
+    fp8 = exl3 and dense_kind() in ("fp8", "q4")
+    dense, dense_stack = (make_f8, stack_f8) if fp8 else (make_b16, stack_b16)
+    # TF_GLM_DENSE=q4: the projections in 4 bits (MSE-searched groups of 64), the head and kv_b in FP8
+    if exl3 and dense_kind() == "q4":
+        from .qmm import make_dense_q4, stack_dense_q4
 
-    def stack(names: list[str]) -> Q4 | B16:
+        big, big_stack = make_dense_q4, stack_dense_q4
+    else:
+        big, big_stack = dense, dense_stack
+    kvb = kvb_kind() if exl3 else "bf16"         # an MLX checkpoint's kv_b is 4-bit as stored
+
+    def q4(name: str) -> Q4 | B16 | F8:
+        return big(t(name + ".weight")) if exl3 else make_q4(*trip(name))
+
+    def stack(names: list[str]) -> Q4 | B16 | F8:
         if exl3:
-            return stack_b16([t(n + ".weight") for n in names])
+            return big_stack([t(n + ".weight") for n in names])
         return stack_q4([trip(n) for n in names])
 
     def hc(i: int, site: str) -> HCW:
@@ -293,18 +342,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
         proj = stack([p + "q_a_proj", p + "kv_a_proj_with_mqa"])
         rows = torch.arange(HL * 512, device=dev).view(HL, 512)
         krows, vrows = rows[:, :cfg.qk_dim].reshape(-1), rows[:, cfg.qk_dim:].reshape(-1)
+        # the latent path reads kv_b only through ``absorb``: the per-head key and value matrices (kv_k, kv_v) exist
+        # only without it (TF_GLM_LATENT=0), so they take no memory beside it
+        kv_k = kv_v = None
         if exl3:
             w = t(p + "kv_b_proj.weight")
-            kv_k, kv_v = make_b16(w[krows]), make_b16(w[vrows])
-            full_k, full_v = (lambda: w[krows].float()), (lambda: w[vrows].float())
+            if not latent.ENABLED:
+                kv_k, kv_v = dense(w[krows]), dense(w[vrows])
         else:
             w, s, b = trip(p + "kv_b_proj")
-            kv_k = make_q4(w[krows], s[krows], b[krows])
-            kv_v = make_q4(w[vrows], s[vrows], b[vrows])
+            if not latent.ENABLED:
+                kv_k = make_q4(w[krows], s[krows], b[krows])
+                kv_v = make_q4(w[vrows], s[vrows], b[vrows])
         if not latent.ENABLED:
             absorb = None
-        elif exl3:
-            absorb = latent.AbsorbW.from_rows(full_k(), full_v(), HL)
+        elif exl3:                        # TF_GLM_KVB: bf16 as stored, or fp8 / q4 (lossy, half / a quarter the bytes)
+            absorb = latent.from_bf16(w[krows], w[vrows], HL, kvb)
         elif cfg.group_size == 64:        # the checkpoint's own 4-bit rows, read as they are stored
             absorb = latent.AbsorbQ4((w[krows], s[krows], b[krows]), (w[vrows], s[vrows], b[vrows]), HL)
         else:
@@ -414,22 +467,22 @@ def load(model_dir: str | Path, *, rank: int, device: str = "cuda", mtp: bool = 
     try:                                          # a failed load still cancels the reads queued ahead
         which = list(range(cfg.layers))
         built = [layer(i) for i in which]
-        vl = cfg.vocab // world
+        v0, v1 = lay.vocab_offset, lay.vocab_offset + lay.vocab
         draft_head = None
         if exl3:
-            head = make_b16(rd.get("lm_head.weight")[rank * vl:(rank + 1) * vl].to(dev))
-            # Draft steps use the quantized head; verification keeps the original head.
-            draft_head = quantize4(head.weight)
+            raw = rd.get("lm_head.weight")[v0:v1].to(dev)
+            head = dense(raw)
+            # Draft steps use a 4-bit copy (TF_GLM_DRAFT_QUANT: minmax or mse ranges); verification keeps the head.
+            draft_head = None if draft_quant() == "bf16" and isinstance(head, B16) else draft_quantize4(raw)
         else:
             hw, hs, hb = (rd.get("lm_head." + x) for x in ("weight", "scales", "biases"))
-            head = make_q4(as_i32(hw[rank * vl:(rank + 1) * vl]).to(dev), hs[rank * vl:(rank + 1) * vl].to(dev),
-                           hb[rank * vl:(rank + 1) * vl].to(dev))
+            head = make_q4(as_i32(hw[v0:v1]).to(dev), hs[v0:v1].to(dev), hb[v0:v1].to(dev))
         mtpw = None
         if cfg.mtp_layers and mtp:
             i = cfg.layers
             mtpw = MTPW(t(f"layers.{i}.enorm.weight"), t(f"layers.{i}.hnorm.weight"), q4(f"layers.{i}.eh_proj"),
                         t(f"layers.{i}.shared_head.norm.weight"), layer(i, plain=True))
-        w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head)
+        w = Weights(cfg, embed, built, t("norm.weight"), head, mtpw, rank, world, dev, draft_head=draft_head, tp=lay)
         w.meta.update(layers=which)
     finally:
         rd.close()
