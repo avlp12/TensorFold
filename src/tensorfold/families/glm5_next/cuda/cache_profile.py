@@ -48,3 +48,14 @@ class CacheProfile:
         mismatched = [key for key, value in required.items() if env.get(key, '').strip() != value]
         if mismatched:
             raise NotImplementedError('B0 startup requires its integrated fixed DFlash2 profile: ' + ', '.join(mismatched))
+
+
+def cache_scope(salt):
+    """Opaque per-request prefix namespace, transmitted identically to TP peers."""
+    if salt is None:
+        return ()
+    if not isinstance(salt, str) or len(salt) > 256:
+        raise ValueError('cache_salt must be a string of at most256 characters')
+    import hashlib
+    import struct
+    return tuple(struct.unpack('<8i', hashlib.sha256(salt.encode('utf-8')).digest()))

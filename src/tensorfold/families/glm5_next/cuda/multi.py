@@ -721,7 +721,8 @@ class MultiDecoder:
         slot = next((k for k in range(self.count) if k not in {l.slot for l in self.lanes.values()}), None)
         if slot is None:
             raise NoRoom(f"every one of the {self.count} stream slots is taken")
-        hit = self._resume(key) if draft and key is not None else None
+        scope = tuple(info.get("cache_scope", ()))
+        hit = self._resume(key, scope) if draft and key is not None else None
         encoded_from = len(hit.ids) if hit is not None else 0
         if s.vision is not None:              # encoded before anything is sent: a failure stops here
             feed = self._encode(s.vision, encoded_from)
@@ -763,7 +764,8 @@ class MultiDecoder:
         cut = len(hit.ids) if hit is not None else 0
         shared: list[int] = []
         if draft and key is not None and g.shared:
-            known = [np.asarray(c.key, dtype=np.int64) for c in self.kept if c.key is not None]
+            known = [np.asarray(c.key, dtype=np.int64) for c in self.kept
+                     if c.key is not None and getattr(c, "cache_scope", ()) == scope]
             shared = shared_points(key, cut, grid_point(len(prompt), cut, self.grid), self.grid, g.shared, known,
                                    g.opener)
         sid = self.next_sid
@@ -774,6 +776,7 @@ class MultiDecoder:
 
         packed = pack(s.constraint)
         payload += [len(packed), *packed, len(positions), *positions, int(s.vision is not None)]
+        payload += [len(scope), *scope]
         self._emit(ADMIT, payload)
         try:
             self._admitted(self._parse_admit(payload), s, feed, s.constraint, info.get("spec", ""))
@@ -828,9 +831,14 @@ class MultiDecoder:
         n = p[i]
         positions = p[i + 1:i + 1 + n]
         images = bool(p[i + 1 + n])
+        end = i + 2 + n
+        size = p[end] if end < len(p) else 0
+        if size not in (0, 8) or (end < len(p) and len(p) != end + 1 + size):
+            raise ValueError("invalid ADMIT cache scope")
+        scope = tuple(p[end + 1:end + 1 + size])
         return dict(sid=sid, slot=slot, base=base, size=size, kid=kid, copy=copy, count=count, stop_eos=bool(stop_eos),
                     draft=bool(draft), sampling=sampling, shared=shared, code=code, prompt=prompt, packed=packed,
-                    positions=positions, images=images)
+                    positions=positions, images=images, cache_scope=scope)
 
     def _admitted(self, a: dict, s: Stream, feed, constraint, spec: str = "") -> None:
         """Both ranks: an ADMIT's stream in its slot and extent, resumed from its kept prompt if it names one."""
@@ -840,6 +848,8 @@ class MultiDecoder:
 
         g, e = self.g, self.e
         hit = self._kept_by_id(a["kid"]) if a["kid"] >= 0 else None
+        if hit is not None and getattr(hit, "cache_scope", ()) != a.get("cache_scope", ()):
+            raise ValueError("cached prefix belongs to another request namespace")
         prompt = a["prompt"]
         s.prompt = list(prompt)
         cut = len(hit.ids) if hit is not None else 0
@@ -864,6 +874,7 @@ class MultiDecoder:
         policy = decode_policy(code, g.costs) if code[0] else None
         lane = Lane(s, a["sid"], a["slot"], x, st, self.next_order, code, spec, policy, dflash, feed=feed,
                     constraint=constraint, images=a["images"])
+        lane.cache_scope = a.get("cache_scope", ())
         self.next_sid = max(self.next_sid, a["sid"] + 1)
         self.next_order += 1
         s.sid, s.cached = a["sid"], cut
@@ -909,11 +920,13 @@ class MultiDecoder:
                 return c
         raise RuntimeError(f"rank {self.rank} holds no kept prompt {kid}")
 
-    def _resume(self, key: list[int]):
+    def _resume(self, key: list[int], scope=()):
         """The longest kept strict prefix of ``key`` (a prompt's keyed ids, ``Lane.key``), or the whole prompt when it
         kept its head's logits row (a replay of an earlier prompt), whose DFlash2 window came along."""
         best = None
         for c in self.kept:
+            if getattr(c, "cache_scope", ()) != scope:
+                continue
             n = len(c.ids)
             fits = c.drafter_end == n and c.drafter_rows is not None or self.drafts is None
             fits = fits and not (self.grid and n % self.grid)
@@ -943,13 +956,15 @@ class MultiDecoder:
         snap.head = head
         # rank 0's key: a text prompt's is its ids (shared, not a second list); rank 1 keeps none
         snap.key = None if lane.key is None else snap.ids if not lane.images else lane.key[:n]
+        snap.cache_scope = getattr(lane, "cache_scope", ())
         snap.images = lane.images
         snap.kid = self.next_kid
         self.next_kid += 1
         snap.extent = lane.extent
         snap.shared = n in lane.shared
         # the same ids: the same prompt, unless pictures are in it (rank 1 has no keys; rank 0 resumes by key)
-        for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)]:
+        for c in [c for c in self.kept if c.ids == snap.ids and not (c.images or snap.images)
+                  and getattr(c, "cache_scope", ()) == snap.cache_scope]:
             self._drop(c)
         lane.extent.kept.append(snap)
         self.kept.append(snap)

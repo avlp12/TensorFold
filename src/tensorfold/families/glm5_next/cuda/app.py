@@ -72,6 +72,13 @@ class GlmApp(App):
     def check(self, body: dict[str, Any], *, prepared: PreparedRequest | None = None) -> str | None:
         """Validate the rendered prompt plus max_tokens against the engine context limit before streaming."""
 
+        from .cache_profile import cache_scope
+        try:
+            cache_scope(body.get("cache_salt"))
+        except ValueError as exc:
+            return str(exc)
+        if body.get("cache_salt") is not None and getattr(self.engine, "scheduler", None) is None:
+            return "cache_salt requires the concurrent GLM scheduler"
         problem = self._check_fields(body)
         limit = getattr(self.engine, "limit", None)
         if problem or limit is None:
@@ -97,6 +104,8 @@ class GlmApp(App):
         model = str(body.get("model") or "")
         self.engine.request.policy = body.get("tf_policy") or (model.split("@", 1)[1] if "@" in model else None)
         self.engine.request.stop_eos = not bool(body.get("ignore_eos", False))
+        from .cache_profile import cache_scope
+        self.engine.request.cache_scope = cache_scope(body.get("cache_salt"))
         result = super().run(body, chat, emit, prepared=prepared, cancelled=cancelled)
         kept = getattr(self.template, "kept", None)
         if chat and kept is not None and result.get("calls") and result.get("finish") == "tool_calls":

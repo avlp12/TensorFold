@@ -1246,7 +1246,8 @@ class GlmEngine:
                 raise ValueError("image inputs require starting this server with --vision")
             stats = self.scheduler.submit(list(prompt), max_tokens, sampling, bool(draft) and not self.serial_only,
                                           on_tokens, stop_eos=stop_eos, vision=vision, constraint=constraint,
-                                          background=background, glm={"code": code, "spec": spec})
+                                          background=background, glm={"code": code, "spec": spec,
+                                             "cache_scope": getattr(self.request, "cache_scope", ())})
             stats.update(policy=spec, drafts=draft)
             return stats
         positions: list[int] = []
