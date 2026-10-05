@@ -28,7 +28,9 @@ class Scope(unittest.TestCase):
  def test_wire_roundtrip_and_malformed_scope(self):
   # Fixed admission fields, sampling, shared stops, policy, prompt, grammar, images.
   prefix=[0]*9+[0]*10+[0]*4+[0]*4+[2,1,2]+[0]+[0,0]
+  prefix[3]=10240
   scope=p.cache_scope('request-uuid')
+  self.assertEqual(D._parse_admit(prefix+[8,*scope])['size'],10240)
   self.assertEqual(D._parse_admit(prefix+[8,*scope])['cache_scope'],scope)
   self.assertEqual(D._parse_admit(prefix+[0])['cache_scope'],())
   with self.assertRaises(ValueError):D._parse_admit(prefix+[8,*scope[:-1]])

@@ -1168,7 +1168,7 @@ def check_room(w: Weights, st: State, R: int, pos: int | None = None) -> None:
         raise ValueError(f"context {pos + R} past {w.cfg.dense_limit} tokens: this engine was started without long "
                          "contexts (DSA's sparse top-k)")
     if pos + R > st.capacity:
-        raise ValueError("context past the cache capacity")
+        raise ValueError(f"context past the cache capacity: pos={pos}, rows={R}, capacity={st.capacity}, base={st.base}")
 
 
 def stage(w: Weights, st: State, b: Buffers, tokens: Sequence[int]) -> int:

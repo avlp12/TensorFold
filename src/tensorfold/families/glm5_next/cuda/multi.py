@@ -832,10 +832,10 @@ class MultiDecoder:
         positions = p[i + 1:i + 1 + n]
         images = bool(p[i + 1 + n])
         end = i + 2 + n
-        size = p[end] if end < len(p) else 0
-        if size not in (0, 8) or (end < len(p) and len(p) != end + 1 + size):
+        scope_size = p[end] if end < len(p) else 0
+        if scope_size not in (0, 8) or (end < len(p) and len(p) != end + 1 + scope_size):
             raise ValueError("invalid ADMIT cache scope")
-        scope = tuple(p[end + 1:end + 1 + size])
+        scope = tuple(p[end + 1:end + 1 + scope_size])
         return dict(sid=sid, slot=slot, base=base, size=size, kid=kid, copy=copy, count=count, stop_eos=bool(stop_eos),
                     draft=bool(draft), sampling=sampling, shared=shared, code=code, prompt=prompt, packed=packed,
                     positions=positions, images=images, cache_scope=scope)
