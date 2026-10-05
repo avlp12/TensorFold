@@ -130,6 +130,12 @@ class BatchedVerify:
         from .sparse import SPARSE_FROM
 
         e, w, b = self.e, self.w, self.b
+        if e.caches.b0_pools:
+            # The current B0 segmented bridge binds host request extents.
+            # Do not capture those identities as a generic reusable graph.
+            self.graphs.clear()
+            self.cache_epoch = None
+            return
         index = e.caches.index is not None
         self._begin_capture()
         pool = torch.cuda.graph_pool_handle()
@@ -282,7 +288,10 @@ class BatchedVerify:
         lc = planes[caches.kc[di]].tensor
         index = None if caches.index is None else caches.index_tensors(di)
         with prof.timed("dsa (total)"):
-            return dsa_segments(layer, self.w, lc, self.b, R, self.seg_rows, self.sel, index, select=select)
+            views = ([caches.b0_view(di, seg[0], None, self.w.cfg.dense_limit)
+                      for seg in self.seg_rows.segments] if caches.b0_pools else None)
+            return dsa_segments(layer, self.w, lc, self.b, R, self.seg_rows, self.sel, index, select=select,
+                                b0_views=views)
 
     @torch.no_grad()
     def commit(self, segments: Sequence[Segment], keeps: Sequence[int]) -> None:

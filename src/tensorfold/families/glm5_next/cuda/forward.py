@@ -348,7 +348,7 @@ class Caches:
         from .b0_cache import CacheView
 
         matches = [entries for entries in self.b0_bindings.values()
-                   if entries[layer].base == base and entries[layer].capacity == size]
+                   if entries[layer].base == base and (size is None or entries[layer].capacity == size)]
         if len(matches) != 1:
             raise ValueError("B0 state must have exactly one current ownership binding")
         return CacheView(self.b0_pools[layer], matches[0][layer], dense_limit)
@@ -840,7 +840,7 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
 
 
 def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int, rows, sel=None, index=None, *,
-                 select: bool = True) -> torch.Tensor | None:
+                 select: bool = True, b0_views=None) -> torch.Tensor | None:
     """dsa_block on the latent cache for a multi-stream window (``rows``: segments.SegRows, already set): several
     streams' rows back to back, each stream's latents (lc), index keys, gates and pooled keys (index: arenas) in
     its own extent. Each segment's rows get the bits of that segment alone through dsa_block (the projections,
@@ -859,7 +859,11 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
     mm(b, b.qr[:R], a.q_b, b.xs_qr[:R], b.q[:R].view(R, HL * c.qk_dim))
     s = b.lat_s
     with prof.timed("dsa: latent write"):
-        latent.seg_latent_write(b.lat[:R], lc, rows)
+        if b0_views is None:
+            latent.seg_latent_write(b.lat[:R], lc, rows)
+        else:
+            from .b0_cache import segmented_write
+            segmented_write(b0_views, rows, b.lat[:R])
     tokens = counts = None
     if index is not None:
         ik, ig, pk = index
@@ -876,7 +880,11 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
         qa = latent.absorb_q(b.q[:R], a.absorb, s.qa[:R])
     l2pf.site(layer.index, "o")
     with prof.timed("dsa: attention"):
-        ol = latent.seg_attention(qa, lc, rows, tokens, counts, s, scale=c.qk_dim ** -0.5, out=s.ol[:R])
+        if b0_views is None:
+            ol = latent.seg_attention(qa, lc, rows, tokens, counts, s, scale=c.qk_dim ** -0.5, out=s.ol[:R])
+        else:
+            from .b0_cache import segmented_attention
+            ol = segmented_attention(b0_views, rows, qa, tokens, counts, s.ol[:R], c.qk_dim ** -0.5)
     with prof.timed("dsa: expand"):
         o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))

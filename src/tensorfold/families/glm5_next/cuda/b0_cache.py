@@ -206,3 +206,51 @@ class CacheView:
         # Zero counts name rows already computed by the dense path.
         out.copy_(torch.where((counts > 0)[:, None, None], values, out))
         return out
+
+
+def _segments(views, rows, count):
+    """Validate host bindings before any segmented write; graph capture unsupported."""
+    if rows.pos.is_cuda and torch.cuda.is_current_stream_capturing():
+        raise RuntimeError("B0 host-bound segmented dispatch must remain eager")
+    if len(views) != len(rows.segments) or sum(s[2] for s in rows.segments) != count:
+        raise ValueError("B0 segment count does not match request bindings")
+    for view, segment in zip(views, rows.segments, strict=True):
+        base, pos, n = segment[:3]
+        view.pool._owned(view.extent)
+        if base != view.extent.base or pos < 0 or n <= 0 or pos + n > view.extent.capacity:
+            raise ValueError("B0 segment outside its owned request extent")
+    at = 0
+    for view, segment in zip(views, rows.segments, strict=True):
+        base, pos, n = segment[:3]
+        expected = torch.arange(pos, pos + n, device=rows.pos.device, dtype=rows.pos.dtype)
+        if not torch.equal(rows.pos[at:at+n], expected) or not bool((rows.base[at:at+n] == base).all()):
+            for affected in views:
+                affected.pool.error.fill_(True)
+            raise ValueError("B0 device segment table differs from host ownership")
+        at += n
+
+
+def segmented_write(views, rows, values):
+    _segments(views, rows, values.shape[0])
+    at = 0
+    for view, segment in zip(views, rows.segments, strict=True):
+        n = segment[2]
+        view.write(values[at:at+n], rows.pos[at:at+1])
+        at += n
+
+
+def segmented_attention(views, rows, q, tokens, counts, out, scale):
+    _segments(views, rows, q.shape[0])
+    if (tokens is None) != (counts is None):
+        raise ValueError("B0 sparse tokens and counts must both be present")
+    at = 0
+    for view, segment in zip(views, rows.segments, strict=True):
+        _, pos, n = segment[:3]
+        position = rows.pos[at:at+1]
+        dense = n if tokens is None else min(n, max(0, view.dense_limit - pos))
+        if dense:
+            view.dense(q[at:at+dense], position, out[at:at+dense], scale)
+        if tokens is not None:
+            view.sparse(q[at:at+n], position, tokens[at:at+n], counts[at:at+n], out[at:at+n], scale)
+        at += n
+    return out
