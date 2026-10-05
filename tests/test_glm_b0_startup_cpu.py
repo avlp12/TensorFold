@@ -21,7 +21,28 @@ class Startup(unittest.TestCase):
         self.assertGreater(target.bytes_at(2048), vendor.bytes_at(2048))
         self.assertNotEqual(mode.code(), p.CacheProfile.from_env('fp8', {}).code())
         with self.assertRaises(NotImplementedError):
-            mode.require_ready()
+            mode.require_ready({})
+
+
+    def test_integrated_state_needs_current_owner(self):
+        import types
+        w = f.weights(indexed=False)
+        w.meta['b0_speculation'] = True
+        for i, layer in enumerate(w.layers): layer.index = i
+        c = f.Caches(w, 32, kv='fp8', latent_kv='b0_fp8')
+        z = f.torch.zeros
+        slots = types.SimpleNamespace(pos_dev=z(1,1,dtype=f.torch.int32),
+            mtp_pos_dev=z(1,1,dtype=f.torch.int32), conv=z(1,0,3,1),
+            rec=z(1,2,0,1), proj=z(1,0,4,1), scratch=[None])
+        with self.assertRaisesRegex(ValueError, 'ownership binding'):
+            f.State(w,32,4,caches=c,slots=slots)
+        c.b0_home_claim(32)
+        state = f.State(w,32,4,caches=c,slots=slots)
+        self.assertEqual((state.base,state.capacity),(0,32))
+        c.b0_home_release()
+        with self.assertRaisesRegex(ValueError, 'ownership binding'):
+            f.State(w,32,4,caches=c,slots=slots)
+
 
     def test_vendor_defaults_and_invalid_combinations(self):
         for kind in ('bf16', 'fp8'):

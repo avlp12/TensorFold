@@ -515,6 +515,12 @@ class Drafter:
         softmax share of its score) appended to it, for a caller that cuts the chains itself (``multi``'s joint
         allocation)."""
 
+        if self.w.meta.get("b0_speculation", False):
+            if confidence or beta or round_ms is not None or confs is not None:
+                raise ValueError("B0 DFlash2 uses fixed-depth standard rejection, not adaptive keyed confidence")
+            from .b0_speculation import propose
+
+            return propose(self, tokens, values, proj, anchor, first, sampling)
         depth = tokens.shape[0]
         sampled = sampling is not None and sampling.temperature > 0
         temp = float(sampling.temperature) if sampled else 1.0

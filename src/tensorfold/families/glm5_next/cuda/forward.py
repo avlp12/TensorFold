@@ -479,7 +479,12 @@ class State:
                  slots: Slots | None = None, slot: int = 0, kv: str = "bf16") -> None:
         self.caches = caches if caches is not None else Caches(w, capacity, kv=kv)
         if self.caches.latent_kv == "b0_fp8":
-            raise NotImplementedError("B0 model startup remains gated: DFlash2 parity and integrated startup validation pending")
+            if not w.meta.get("b0_speculation", False) or w.mtp is not None:
+                raise NotImplementedError("B0 startup requires the integrated DFlash2 path and no MTP")
+            # Every model state must already own its extent, including startup
+            # home and reused scheduler slots. Never infer ownership from views.
+            for i in range(len(self.caches.b0_pools)):
+                self.caches.b0_view(i, base, capacity, 0)
         self.slots = slots if slots is not None else Slots(w, 1, rows)
         self.slot = slot
         kda_layers = [l for l in w.layers if l.kind == "kda"]

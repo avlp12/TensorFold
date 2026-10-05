@@ -906,6 +906,7 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
             drafts = (drafter.propose(out[-1], depth, sampling, policy.confidence, **policy.chain_rule)
                       if depth > 0 else [])
         t1 = time.perf_counter()
+        proposal = drafts
         tokens = e.verify_window([out[-1]] + drafts)
         drafts = tokens[1:]
         R = len(tokens)
@@ -914,12 +915,26 @@ def dflash_decode(e: Engine, drafter, pending: int, count: int, sampling: Sampli
         clock.stop()
         late.flush()                        # the last round's tokens, while this window runs
         t2 = time.perf_counter()
-        sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
-        keep = 1
-        for i, d in enumerate(drafts):
-            if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
-                break
-            keep += 1
+        if w.meta.get("b0_speculation", False):
+            from .b0_speculation import verify
+
+            if copied:
+                raise ValueError("B0 comparison does not allow copy drafts")
+            e.caches.check_b0(w.world, w.comm)
+            if e.constraint is not None and e.window is not None:
+                e.constraint.mask(logits[:R], e.window, w.vocab_offset)
+                e.window = None
+            if e.vote is not None:
+                e.vote.gather(one_rank if w.comm is None else comm_gather(w.comm))(logits.new_zeros((0,)))
+            sampled = verify(w, logits[:R], tokens, proposal, st.pos, sampling, stop_eos=stop_eos)
+            keep = len(sampled)
+        else:
+            sampled = e.sample(logits[:R], [st.pos + 1 + r for r in range(R)], sampling)
+            keep = 1
+            for i, d in enumerate(drafts):
+                if sampled[i] != d or (stop_eos and sampled[i] in w.cfg.eos):
+                    break
+                keep += 1
         t3 = time.perf_counter()
         commit(w, st, b, R, keep)
         t4 = time.perf_counter()

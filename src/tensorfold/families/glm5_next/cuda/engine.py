@@ -578,6 +578,11 @@ class GlmEngine:
         # Fail before capacity probing or loading hundreds of GB of weights.
         # State retains its independent guard until the complete B0 path is ready.
         self.cache_profile.require_ready()
+        if self.cache_profile.indexer == "b0":
+            if drafter is None or serial_only or world != 4 or parallel != 8 or context != 850000:
+                raise ValueError("B0 startup requires original DFlash2, TP4, parallel8 and context850000")
+            if policy not in ("auto", "f3") or DFLASH_POLICY != "f3":
+                raise ValueError("B0 startup requires fixed f3 DFlash2 policy")
         if (kv != "bf16" or self.cache_profile.latent_kv != "bf16") and not LATENT:
             raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
         self.kv = kv
@@ -748,6 +753,7 @@ class GlmEngine:
             torch.cuda.synchronize()
         w = load(model_dir, rank=rank, world=world, mtp=self.mtp_on, indexer=self.cache_profile.indexer)
         w.comm = self.comm
+        w.meta["b0_speculation"] = self.cache_profile.indexer == "b0"
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
         self.comm.barrier()
         self.w = w

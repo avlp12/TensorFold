@@ -35,6 +35,16 @@ class CacheProfile:
     def options(self):
         return {'kv': self.kv, 'latent_kv': self.latent_kv}
 
-    def require_ready(self):
-        if self.latent_kv == 'b0_fp8':
-            raise NotImplementedError('B0 model startup remains gated: DFlash2 parity and integrated startup validation pending')
+    def require_ready(self, env=None):
+        if self.latent_kv != 'b0_fp8':
+            return
+        env = os.environ if env is None else env
+        required = {'TF_GLM_LATENT': '1', 'TF_GLM_KV': 'fp8', 'TF_GLM_DENSE': 'bf16',
+                    'TF_GLM_KVB': 'bf16', 'TF_GLM_DRAFT_QUANT': 'bf16',
+                    'TF_GLM_DFLASH_BLOCK': '4', 'TF_GLM_DFLASH_EDGE': '1',
+                    'TF_GLM_DFLASH_NOISE': '1', 'TF_GLM_DFLASH_POLICY': 'f3',
+                    'TF_GLM_COPY_DRAFTS': '0', 'TF_GLM_MTP': '0',
+                    'TF_GLM_MULTI_DEPTH': 'policy', 'TF_GLM_DISPLAY_KV_MIB': '0'}
+        mismatched = [key for key, value in required.items() if env.get(key, '').strip() != value]
+        if mismatched:
+            raise NotImplementedError('B0 startup requires its integrated fixed DFlash2 profile: ' + ', '.join(mismatched))

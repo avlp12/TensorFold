@@ -1493,6 +1493,10 @@ class MultiDecoder:
             raise RuntimeError(f"rank {self.rank}'s draft depths {[l.depth for l in lanes]} are not rank 0's {depths}")
         prof = self.profile
         tune = self.tune
+        b0 = self.w.meta.get("b0_speculation", False)
+        if b0 and tune.depth == "joint":
+            raise ValueError("B0 DFlash2 does not allow adaptive joint draft depth")
+        proposals = [None] * len(lanes)
         drafts: list[list[int]] = []
         copied: list[bool] = []
         asks = []
@@ -1511,6 +1515,7 @@ class MultiDecoder:
         elif asks:
             got = self.drafts.propose([a for _, a in asks])
             for (k, _), d in zip(asks, got):
+                proposals[k] = d
                 drafts[k] = list(d)
         drafts = trim(drafts, self.window)
         if prof is not None:
@@ -1543,16 +1548,26 @@ class MultiDecoder:
         # A short round has one row per stream: pack nucleus gathers too, avoiding
         # repeated rank exchanges between prompt slices with the same exact draws.
         self.e.caches.check_b0(self.w.world, self.w.comm)
-        sampled = sample_packed(self.w, parts) if short or tune.sampler == "packed" else sample_streams(self.w, parts)
+        if b0:
+            from .b0_speculation import verify as b0_verify
+
+            if any(copied):
+                raise ValueError("B0 comparison does not allow copy drafts")
+            sampled = [b0_verify(self.w, part[0], seg.tokens, q, lane.st.pos, lane.s.sampling,
+                                 stop_eos=lane.s.stop_eos)
+                       for lane, seg, part, q in zip(lanes, segments, parts, proposals)]
+        else:
+            sampled = sample_packed(self.w, parts) if short or tune.sampler == "packed" else sample_streams(self.w, parts)
         if prof is not None:
             prof.mark("sample")
         keeps = []
         for l, seg, rows in zip(lanes, segments, sampled):
-            keep = 1
-            for i, d in enumerate(seg.tokens[1:]):
-                if rows[i] != d or (l.s.stop_eos and rows[i] in self.eos):
-                    break
-                keep += 1
+            keep = len(rows) if b0 else 1
+            if not b0:
+                for i, d in enumerate(seg.tokens[1:]):
+                    if rows[i] != d or (l.s.stop_eos and rows[i] in self.eos):
+                        break
+                    keep += 1
             keeps.append(keep)
         if prof is not None:
             prof.mark("accept")
