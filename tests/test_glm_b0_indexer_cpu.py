@@ -29,6 +29,12 @@ class Indexer(unittest.TestCase):
   i.validate_pools(k,g,ape,error)
   for bk,bg,ba in [(k.float(),g,ape),(k,g.float(),ape),(k,g,ape.bfloat16()),(k[:,:2],g[:,:2],ape[:2])]:
    with self.assertRaises(ValueError):i.validate_pools(bk,bg,ba,error)
+ def test_selection_metadata_and_modes(self):
+  q=torch.zeros(2,32,128,dtype=torch.bfloat16);w=torch.zeros(2,32,dtype=torch.bfloat16);e=torch.zeros((),dtype=torch.bool);pk=torch.zeros(513,132,dtype=torch.uint8);pos=torch.tensor([2048,2051],dtype=torch.int64)
+  i.validate_selection(q,w,pk,pos,e,True,False)
+  i.validate_selection(q,w,pk[:0],pos,e,True,True)
+  for args in [(pk.float(),pos,True,False),(pk,pos.float(),True,False),(pk,pos,False,True),(pk,pos,1,False)]:
+   with self.assertRaises(ValueError):i.validate_selection(q,w,args[0],args[1],e,args[2],args[3])
  def test_actual_loader_ape_preserves_f32_in_b0_mode(self):
   tree=ast.parse((ROOT/'weights.py').read_text());load=next(x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=='load')
   tf=next(x for x in load.body if isinstance(x,ast.FunctionDef) and x.name=='t');dsa=next(x for x in load.body if isinstance(x,ast.FunctionDef) and x.name=='dsa');ix=next(x for x in dsa.body if isinstance(x,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='ix' for t in x.targets))

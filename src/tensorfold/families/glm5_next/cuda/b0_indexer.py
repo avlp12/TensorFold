@@ -95,3 +95,76 @@ def page_rows(cache):
     codes = flat[:, :size * WIDTH].reshape(pages, size, WIDTH)
     scales = flat[:, size * WIDTH:].reshape(pages, size, 4)
     return torch.cat((codes, scales), dim=-1).reshape(-1, ROW_BYTES)
+
+
+def validate_selection(q, weights, packed, positions, error, prefill, short_prefill):
+    validate_query(q, weights, error)
+    if packed.ndim != 2 or packed.shape[1] != ROW_BYTES or packed.dtype != torch.uint8 or not packed.is_contiguous() or packed.device != q.device:
+        raise ValueError('resident canonical uint8 [pools,132] required')
+    if positions.shape != (q.shape[0],) or positions.dtype not in (torch.int32, torch.int64) or positions.device != q.device:
+        raise ValueError('one integer token position per query required')
+    if type(prefill) is not bool or type(short_prefill) is not bool or (short_prefill and not prefill):
+        raise ValueError('short_prefill is only valid on the explicit prefill path')
+    if packed.shape[0] * 4 + 3 >= 2**31:
+        raise ValueError('indexer positions exceed int32 kernel range')
+
+
+def select(q, weights, packed, positions, error, *, prefill, short_prefill=False):
+    """Unpaged B0 score/top-k adapter using the original vLLM CUDA primitives.
+
+    No model/engine calls: only DeepGEMM MQA logits and original top-k/expansion
+    kernels. Paged-decode performance and full engine admission remain separate.
+    ``short_prefill`` is the original metadata predicate (whole chunk <=2048),
+    not an implicit per-row substitute for a long prefill.
+    """
+    validate_selection(q, weights, packed, positions, error, prefill, short_prefill)
+    if q.device.type != 'cuda':
+        raise ValueError('B0 index selection requires CUDA')
+    q_codes, folded = query(q, weights, error)
+    p64 = positions.to(torch.int64)
+    visible = (p64 + 1) // 4
+    bad_pos = (p64 < 0) | (visible > packed.shape[0])
+    error.logical_or_(bad_pos.any())
+    safe_pos = torch.where(bad_pos, 0, p64).to(torch.int32)
+    if short_prefill:
+        error.logical_or_((p64 >= 2048).any())
+        cols = torch.arange(2048, device=q.device, dtype=torch.int32)
+        tokens = torch.where(cols[None, :] <= safe_pos[:, None], cols[None, :], -1)
+        return tokens, (tokens >= 0).sum(-1).to(torch.int32)
+
+    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+    from vllm import _custom_ops  # registers the original torch.ops._C top-k kernels
+    from .b0_indexer_kernel import expand_pools_and_append_tail
+
+    values = packed[:, :WIDTH].contiguous()
+    scales = packed[:, WIDTH:].contiguous().view(torch.float32).reshape(-1)
+    bad_keys = (((values & 127) == 127).any(-1) | ~torch.isfinite(scales) | (scales <= 0))
+    error.logical_or_(bad_keys.any())
+    values = torch.where(bad_keys[:, None], 0, values).view(torch.float8_e4m3fn)
+    scales = torch.where(bad_keys, 1, scales)
+    # Original top-k always returns 512 slots. Explicit masked padding avoids
+    # exposing unallocated columns for short decode contexts. It is outside
+    # every query's exclusive end, so no padded key can be selected.
+    padding = max(0, 512 - values.shape[0])
+    if padding:
+        values = torch.cat((values, values.new_zeros((padding, WIDTH))), 0)
+        scales = torch.cat((scales, scales.new_ones(padding)), 0)
+    start = torch.zeros(q.shape[0], dtype=torch.int32, device=q.device)
+    end = visible.clamp(0, packed.shape[0]).to(torch.int32)
+    logits = fp8_fp4_mqa_logits((q_codes, None), (values, scales), folded, start, end, clean_logits=True)
+    ids = torch.full((q.shape[0], 512), -1, dtype=torch.int32, device=q.device)
+    if prefill:
+        torch.ops._C.top_k_per_row_prefill(logits, start, end, ids, q.shape[0], logits.stride(0), logits.stride(1), 512)
+    else:
+        torch.ops._C.top_k_per_row_decode(logits, 1, end, ids, q.shape[0], logits.stride(0), logits.stride(1), 512)
+    invalid = (ids < -1) | (ids >= end[:, None])
+    error.logical_or_(invalid.any())
+    ids = torch.where(invalid, -1, ids)
+    # Preserve original B0's select_k-1 history groups plus incomplete tail.
+    expanded = expand_pools_and_append_tail(ids[:, :511].to(torch.int64), safe_pos + 1, 4)
+    tokens = torch.full((q.shape[0], 2048), -1, dtype=torch.int32, device=q.device)
+    tokens[:, :expanded.shape[1]] = expanded
+    future = tokens > safe_pos[:, None]
+    error.logical_or_(future.any())
+    tokens = torch.where(future, -1, tokens)
+    return tokens, (tokens >= 0).sum(-1).to(torch.int32)
