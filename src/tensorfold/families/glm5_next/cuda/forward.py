@@ -342,6 +342,32 @@ class Caches:
         del self.b0_bindings[key]
         self.b0_epoch += 1
 
+    def check_b0(self, world, comm):
+        """All ranks agree on sticky cache errors before any sampled token escapes.
+
+        This collective must run at the same sampling boundary on every rank,
+        outside capture. A peer failure poisons this rank too. Default caches
+        have no B0 pools and keep their existing sampling/communication path.
+        """
+        if not self.b0_pools:
+            return
+        device = self.b0_pools[0].error.device
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("B0 publication check must run outside graph capture")
+        if type(world) is not int or world < 1 or (world > 1 and comm is None):
+            raise ValueError("B0 publication requires the actual all-rank communicator")
+        local = torch.stack([p.error for p in self.b0_pools]).any().to(torch.int32).reshape(1)
+        if world == 1:
+            gathered = local
+        else:
+            gathered = torch.empty(world, dtype=torch.int32, device=device)
+            comm.all_gather(local, gathered)
+        bad = [i for i, flag in enumerate(gathered.tolist()) if flag != 0]
+        if bad:
+            for pool in self.b0_pools:
+                pool.error.fill_(True)
+            raise ValueError(f"B0 cache error before token publication on ranks {bad}")
+
     def b0_auxiliary_bytes(self) -> int:
         """Bytes not exposed as arena rows: generations, sink rows and error flags."""
         return sum(p.generations.numel() * p.generations.element_size()

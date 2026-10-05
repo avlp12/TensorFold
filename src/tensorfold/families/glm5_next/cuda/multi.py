@@ -1389,6 +1389,7 @@ class MultiDecoder:
             logits = out[:1]
             if lane.constraint is not None:             # the first token's row, under the reply's grammar
                 lane.constraint.mask(logits, lane.constraint.window([0], [-1]), self.w.vocab_offset)
+            self.e.caches.check_b0(self.w.world, self.w.comm)
             first = sample_streams(self.w, [(logits, [n], s.sampling)])[0][0]
             if lane.constraint is not None:
                 lane.constraint.advance([first])
@@ -1461,6 +1462,7 @@ class MultiDecoder:
             who.append(k)
         firsts: list[int | None] = [None] * len(group)
         if parts:
+            self.e.caches.check_b0(self.w.world, self.w.comm)
             for k, rows in zip(who, sample_streams(self.w, parts)):
                 lane = group[k][0]
                 firsts[k] = rows[0]
@@ -1536,6 +1538,7 @@ class MultiDecoder:
             parts.append((logits, [l.st.pos + 1 + r for r in range(len(seg.tokens))], l.s.sampling))
         # A short round has one row per stream: pack nucleus gathers too, avoiding
         # repeated rank exchanges between prompt slices with the same exact draws.
+        self.e.caches.check_b0(self.w.world, self.w.comm)
         sampled = sample_packed(self.w, parts) if short or tune.sampler == "packed" else sample_streams(self.w, parts)
         if prof is not None:
             prof.mark("sample")

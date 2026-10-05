@@ -276,6 +276,7 @@ class Engine:
 
     def sample(self, logits: torch.Tensor, positions: Sequence[int], sampling: Sampling | None, *,
                draft: bool = False, probs: list[float] | None = None) -> list[int]:
+        self.caches.check_b0(self.w.world, self.w.comm)
         if not draft and self.constraint is not None and self.window is not None:
             self.constraint.mask(logits, self.window, self.w.vocab_offset)   # this rank's vocabulary columns
             self.window = None
