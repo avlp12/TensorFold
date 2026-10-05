@@ -631,7 +631,7 @@ class MultiDecoder:
         out = []
         for R in range(1, self.lone_rows + 1):
             g = e.graphs.main.get((R, e.home.parity))
-            if g is None:
+            if g is None or not e.graphed(e.home):
                 continue
             stage(self.w, e.home, e.buf, tokens[:R])
             best = float("inf")

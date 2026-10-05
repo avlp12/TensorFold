@@ -20,6 +20,7 @@ def pool_buckets(np_max: int) -> list[int]:
 
 class Graphs:
     def __init__(self, e, main_rows=(1, 2, 3, 4), mtp_rows=(1, 2, 3, 4)) -> None:
+        self.cache_epoch = e.caches.b0_epoch
         self.pool = torch.cuda.graph_pool_handle()
         self.main: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.mtp: dict[int, torch.cuda.CUDAGraph] = {}

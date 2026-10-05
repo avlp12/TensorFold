@@ -115,6 +115,7 @@ class BatchedVerify:
         self.segments: list[Segment] = []
         self.R = 0
         self.graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self.cache_epoch = None
         self.replays = {"graph": 0, "eager": 0}
 
     @torch.no_grad()
@@ -130,6 +131,7 @@ class BatchedVerify:
 
         e, w, b = self.e, self.w, self.b
         index = e.caches.index is not None
+        self._begin_capture()
         pool = torch.cuda.graph_pool_handle()
         for R in rows or range(1, self.rows_max + 1):
             self._stage([0] * R)
@@ -147,6 +149,20 @@ class BatchedVerify:
         e.slots.rec[0].zero_()
         e.slots.conv[0].zero_()
 
+    def _begin_capture(self):
+        epoch = self.e.caches.b0_epoch
+        if epoch != self.cache_epoch:
+            self.graphs.clear()  # partial recapture must not revive old shapes
+        self.cache_epoch = epoch
+
+    def graph_for(self, rows):
+        # Captured request ownership must not survive slot reuse/relocation.
+        # A future per-request generation table can avoid this conservative
+        # eager fallback, once its full scheduler path has numerical proof.
+        if self.cache_epoch != self.e.caches.b0_epoch:
+            return None
+        return self.graphs.get(rows)
+
     # -- the window's tables -------------------------------------------------------------------------------------------
     @torch.no_grad()
     def time_rows(self, reps: int = 5, most: int | None = None) -> list[float]:
@@ -162,7 +178,9 @@ class BatchedVerify:
         start, stop = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
         tokens = timing_tokens(self.w.cfg.vocab, self.rows_max)
         for R in range(1, min(most or self.rows_max, self.rows_max) + 1):
-            g = self.graphs[R]
+            g = self.graph_for(R)
+            if g is None:
+                raise RuntimeError("cannot time stale cache-ownership graphs")
             self._stage(tokens[:R])
             self.seg_rows.set([self._span(self.e.home, 0, R)], sparse_from=SPARSE_FROM if index else None)
             self._write_table([(R, 0, 0, 0, R)])
@@ -230,7 +248,7 @@ class BatchedVerify:
         self.seg_rows.set(spans, sparse_from=SPARSE_FROM if index else None)
         self._tables(segments)
         self.segments, self.R = list(segments), R
-        g = self.graphs.get(R)
+        g = self.graph_for(R)
         if g is not None:
             self.replays["graph"] += 1
             g.replay()

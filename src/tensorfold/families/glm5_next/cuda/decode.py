@@ -225,7 +225,8 @@ class Engine:
 
         st = self.st if st is None else st
         return (self.graphs is not None and st.caches is self.caches and st.slots is self.slots
-                and st.graph_key == self.home.graph_key)
+                and st.graph_key == self.home.graph_key
+                and self.graphs.cache_epoch == self.caches.b0_epoch)
 
     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
         """A step's forward (a CUDA graph when one was captured for its shape and state): logits [R, V/world]."""
