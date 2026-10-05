@@ -155,3 +155,54 @@ class PackedCachePool:
             raise RuntimeError("check cache errors outside CUDA graph capture")
         if bool(self.error):
             raise ValueError("B0 cache pool poisoned by an invalid read, write or attention result")
+
+
+class CacheView:
+    """One layer/request binding used by forward's latent dispatch.
+
+    Attention values here are intermediate graph buffers. The shared sticky
+    error must be checked by Caches.check_b0 before sampling or publishing.
+    """
+    def __init__(self, pool, extent, dense_limit):
+        pool._owned(extent)
+        if type(dense_limit) is not int or dense_limit <= 0:
+            raise ValueError("positive dense attention limit required")
+        self.pool, self.extent = pool, extent
+        self.dense_limit = dense_limit
+        self.dense_keys = min(dense_limit, extent.capacity)
+
+    def _positions(self, pos, rows):
+        if pos.shape != (1,) or pos.dtype not in (torch.int32, torch.int64) or pos.device != self.pool.storage.device:
+            raise ValueError("one device integer position required")
+        return pos.to(torch.int64) + torch.arange(rows, device=pos.device, dtype=torch.int64)
+
+    def write(self, values, pos):
+        self.pool.write(self.extent, self._positions(pos, values.shape[0]), values)
+
+    def dense(self, q, pos, out, scale):
+        if q.shape[0] == 0:
+            return out
+        positions = self._positions(pos, q.shape[0])
+        keys = torch.arange(self.dense_keys, device=q.device, dtype=torch.int64)
+        indices = keys[None, :].expand(q.shape[0], -1).contiguous()
+        # Keep int64 bounds checks before converting the length for the kernel.
+        lengths = positions + 1
+        self.pool.error.logical_or_(((lengths < 1) | (lengths > self.dense_keys)).any())
+        safe = lengths.clamp(0, self.dense_keys).to(torch.int32)
+        values = self.pool.attention(self.extent, q, indices, safe, scale)._values
+        out.copy_(values)
+        return out
+
+    def sparse(self, q, pos, tokens, counts, out, scale):
+        if tokens.dtype not in (torch.int32, torch.int64) or counts.dtype != torch.int32:
+            raise ValueError("integer token indices and int32 counts required")
+        positions = self._positions(pos, q.shape[0])
+        active = torch.arange(tokens.shape[1], device=tokens.device)[None, :] < counts[:, None]
+        future = active & (tokens >= 0) & (tokens > positions[:, None])
+        missing = (positions >= self.dense_limit) & (counts <= 0)
+        self.pool.error.logical_or_(future.any() | missing.any())
+        selected = torch.where(future, -1, tokens).to(torch.int64).contiguous()
+        values = self.pool.attention(self.extent, q, selected, counts, scale)._values
+        # Zero counts name rows already computed by the dense path.
+        out.copy_(torch.where((counts > 0)[:, None, None], values, out))
+        return out

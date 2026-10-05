@@ -342,6 +342,17 @@ class Caches:
         del self.b0_bindings[key]
         self.b0_epoch += 1
 
+    def b0_view(self, layer, base, size, dense_limit):
+        if not self.b0_pools:
+            return None
+        from .b0_cache import CacheView
+
+        matches = [entries for entries in self.b0_bindings.values()
+                   if entries[layer].base == base and entries[layer].capacity == size]
+        if len(matches) != 1:
+            raise ValueError("B0 state must have exactly one current ownership binding")
+        return CacheView(self.b0_pools[layer], matches[0][layer], dense_limit)
+
     def check_b0(self, world, comm):
         """All ranks agree on sticky cache errors before any sampled token escapes.
 
@@ -696,7 +707,7 @@ def dsa_front(layer: LayerW, w: Weights, b: Buffers, lo: int, hi: int) -> None:
 
 def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
               R: int, nch: int | None, index=None, host_pos: int | None = None,
-              sparse_np: int | None = None, done: tuple[int, int] | None = None) -> torch.Tensor:
+              sparse_np: int | None = None, done: tuple[int, int] | None = None, b0=None) -> torch.Tensor:
     """Write every index key and pool; rows past the dense limit attend to their top-512 pools (host_pos eager, or sparse_np in a captured graph). ``done``: rows ``dsa_front`` already ran on (TF_GLM_PREFILL_OVERLAP=2)."""
 
     c = w.cfg
@@ -705,7 +716,7 @@ def dsa_block(layer: LayerW, w: Weights, kc: torch.Tensor, vc: torch.Tensor, pos
         dsa_front(layer, w, b, lo, hi)
     HL = a.heads
     if a.absorb is not None:
-        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer=layer.index)
+        return _dsa_latent(a, w, kc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer=layer.index, b0=b0)
     if sparse_np is not None:
         raise ValueError("sparse CUDA graphs need the latent cache (TF_GLM_LATENT=1)")
     mm(b, b.lat[:R], a.kv_k, b.xs_lat[:R], b.kn[:R].view(R, HL * c.qk_dim))
@@ -763,15 +774,15 @@ def dense_attention(qa: torch.Tensor, lc: torch.Tensor, pos_dev: torch.Tensor, s
 
 
 def _dsa_latent(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
-                index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1) -> torch.Tensor:
+                index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1, b0=None) -> torch.Tensor:
     """DSA on the latent cache: the same indexer and selection, attention over latents with kv_b's key blocks absorbed into the query."""
 
-    o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer)
+    o = dsa_rows(a, w, lc, pos_dev, b, R, nch, index, host_pos, sparse_np, layer, b0=b0)
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer, "a"))
 
 
 def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers, R: int, nch: int | None,
-             index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1, lo: int = 0) -> torch.Tensor:
+             index, host_pos: int | None, sparse_np: int | None = None, layer: int = -1, lo: int = 0, b0=None) -> torch.Tensor:
     """``_dsa_latent`` up to its output projection, for rows lo .. lo + R of the buffers (their front done) on one
     stream's caches (``lc``, ``index``, ``pos_dev``, ``host_pos``: its first row's position): the latent write,
     indexer update, absorb, attention and expand; returns the rows' attention output [R, heads * v_dim] (b.vn's rows).
@@ -783,7 +794,10 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
     s = b.lat_s
     rs = slice(lo, lo + R)
     with prof.timed("dsa: latent write"):
-        latent.latent_write(b.lat[rs], lc, pos_dev)
+        if b0 is None:
+            latent.latent_write(b.lat[rs], lc, pos_dev)
+        else:
+            b0.write(b.lat[rs], pos_dev)
     # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
     sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
@@ -804,15 +818,20 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
         # and only the rows before it (a row's dense bits do not depend on the rows after it: latent.attention).
         dense = dense_rows(c, R, host_pos) if sparse_rows else R
         with prof.timed("dsa: dense attention"):
-            dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
-                            hb=latent.head_block(R), starts=b.att_starts if b.prefill else None)
+            if b0 is None:
+                dense_attention(qa[:dense], lc, pos_dev, s, scale=scale, nch=min(nch or s.nch, s.nch), out=ol[:dense],
+                                hb=latent.head_block(R), starts=b.att_starts if b.prefill else None)
+            else:
+                b0.dense(qa[:dense], pos_dev, ol[:dense], scale)
     if sparse_rows:
         with prof.timed("dsa: select tokens"):
             mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
             tokens, counts = sparse.select_tokens(b.qi[rs], b.ikr[rs, c.index_dim:], pk, host_pos, R,
                                                   pk.shape[0] - 2, pos_dev, bucket=sparse_np)
         with prof.timed("dsa: sparse attention"):
-            if b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
+            if b0 is not None:
+                b0.sparse(qa, pos_dev, tokens, counts, ol, scale)
+            elif b.prefill and latent.SPARSE_ONEPASS:     # prompt rows: one pass a row, no partials (their own bits)
                 latent.sparse_onepass(qa, lc, tokens, counts, ol, scale)
             else:
                 latent.sparse_attention(qa, lc, tokens, counts, ol, scale)
@@ -943,7 +962,8 @@ def _mixer(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, nch: int | 
     di = st.dsa_index[layer.index]
     with prof.timed("dsa (total)"):
         return dsa_block(layer, w, st.kc[di], st.vc[di], st.pos_dev, b, R, nch,
-                         st.index[di] if st.index is not None else None, host_pos, sparse_np, done)
+                         st.index[di] if st.index is not None else None, host_pos, sparse_np, done,
+                         b0=st.caches.b0_view(di, st.base, st.capacity, w.cfg.dense_limit))
 
 
 def _ffn(layer: LayerW, w: Weights, b: Buffers, R: int, done: tuple[int, int] | None = None) -> torch.Tensor | None:

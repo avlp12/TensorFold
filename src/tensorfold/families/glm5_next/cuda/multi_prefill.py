@@ -136,7 +136,8 @@ class PieceMixer:
                 st = p.st
                 di = st.dsa_index[layer.index]
                 dsa_rows(a, w, st.kc[di], st.pos_dev, b, p.rows, chunks_for(st, p.rows),
-                         st.index[di] if st.index is not None else None, st.pos, None, layer.index, lo=p.lo)
+                         st.index[di] if st.index is not None else None, st.pos, None, layer.index, lo=p.lo,
+                         b0=st.caches.b0_view(di, st.base, st.capacity, w.cfg.dense_limit))
             o = b.vn[:R].view(R, a.heads * c.v_dim)
             return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))
 
