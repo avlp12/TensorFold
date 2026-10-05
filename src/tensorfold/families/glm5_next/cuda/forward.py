@@ -10,6 +10,7 @@ import triton.language as tl
 
 from tensorfold.cuda import experts as grouped
 from tensorfold.cuda.geometry import MLA_PROMPT_ATT_ROWS as PROMPT_ATT_ROWS   # a dense latent call's prompt rows
+from tensorfold.cuda.mla_layout import latent_kind, row_bytes as mla_layout_row_bytes
 from tensorfold.cuda.kernels import prefill_attention, qmm as shared
 
 from . import glue, kda as kda_mod, kv8, l2pf, latent, prof, qmm, sparse, tp
@@ -185,11 +186,14 @@ class Caches:
     ``kv``: the latent planes' and pooled keys' format (TF_GLM_KV, ``kv8``): bf16, or fp8 (a uint8 row a token /
     pool: e4m3 codes, an fp32 power-of-two scale, pad), with the latent cache only.
 
+    ``latent_kv`` overrides latent planes only. b0_fp8 allocation is prepared but
+    State rejects execution until writers/readers/lifecycle and rank checks connect.
+
     ``display``: bytes of the GB10's display reservation the pool was sized with (``display_kv``); the first DSA
     layers' latent planes are then carved from one span that holds them."""
 
     def __init__(self, w: Weights, rows: int, *, streams: int = 1, ring: int | None = None,
-                 kv: str = "bf16", display: int = 0) -> None:
+                 kv: str = "bf16", display: int = 0, latent_kv: str | None = None) -> None:
         from .pool import Arena, Plane
 
         c = w.cfg
@@ -200,6 +204,11 @@ class Caches:
         if kv not in kv8.KINDS or (kv != "bf16" and not self.latent):
             raise ValueError(f"TF_GLM_KV={kv}: bf16, or fp8 with the latent cache (TF_GLM_LATENT=1)")
         self.kv = kv
+        self.latent_kv = latent_kind(kv, latent_kv, c.kv_lora)
+        if self.latent_kv != "bf16" and not self.latent:
+            raise ValueError("quantized MLA rows need the latent cache")
+        if self.latent_kv == "b0_fp8" and display:
+            raise ValueError("B0 packed cache display allocation is not integrated")
         planes: list[Plane] = []
         spanned: list[torch.Tensor] = []
         if display:
@@ -207,18 +216,21 @@ class Caches:
                 raise ValueError("TF_GLM_DISPLAY_KV_MIB needs the latent cache (TF_GLM_LATENT=1)")
             from . import display_kv
 
-            spanned = display_kv.latent_planes(dsa, rows, c.kv_lora, kv, dev, display)
+            spanned = display_kv.latent_planes(dsa, rows, c.kv_lora, self.latent_kv, dev, display)
 
         def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16", tensor=None) -> int:
             n = rows // div + pad
-            t = tensor if tensor is not None else (kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
-                                                   torch.zeros((n, *shape), dtype=torch.bfloat16, device=dev))
+            if fmt == "b0_fp8":
+                t = torch.zeros((n, mla_layout_row_bytes(shape[0], fmt)), dtype=torch.uint8, device=dev)
+            else:
+                t = tensor if tensor is not None else (kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
+                                                       torch.zeros((n, *shape), dtype=torch.bfloat16, device=dev))
             planes.append(Plane(t, div, pad, spanned=tensor is not None))
             return len(planes) - 1
 
         def attention_planes() -> tuple[int, int | None]:
             if self.latent:          # one 512-wide latent a token and layer (kc), no separate values (vc)
-                return add((c.kv_lora,), fmt=kv, tensor=spanned.pop(0) if spanned else None), None
+                return add((c.kv_lora,), fmt=self.latent_kv, tensor=spanned.pop(0) if spanned else None), None
             return add((HL, c.qk_dim)), add((HL, c.v_dim))
 
         self.kc, self.vc = [], []
@@ -330,6 +342,8 @@ class State:
     def __init__(self, w: Weights, capacity: int, rows: int, *, caches: Caches | None = None, base: int = 0,
                  slots: Slots | None = None, slot: int = 0, kv: str = "bf16") -> None:
         self.caches = caches if caches is not None else Caches(w, capacity, kv=kv)
+        if self.caches.latent_kv == "b0_fp8":
+            raise NotImplementedError("B0 allocation only: latent dispatch, lifecycle and rank error checks are not integrated")
         self.slots = slots if slots is not None else Slots(w, 1, rows)
         self.slot = slot
         kda_layers = [l for l in w.layers if l.kind == "kda"]

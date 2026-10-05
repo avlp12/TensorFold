@@ -6,6 +6,7 @@ import math
 import re
 
 from .capacity import Geometry, Weights, headers, itemsize
+from .mla_layout import latent_kind, row_bytes as mla_layout_row_bytes
 
 PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
 PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
@@ -230,11 +231,11 @@ def _indexed_prefill_row(t: dict, world: int, h: int, hk: int, hd: int, nv: int,
 
 
 def mla_row_bytes(width: int, kv: str = "bf16") -> int:
-    """A GLM DSA cache row of ``width`` values: bf16, or TF_GLM_KV=fp8's e4m3 codes, fp32 scale and 12 pad bytes
-    (families/glm5_next/cuda/kv8.py)."""
-    if kv not in ("bf16", "fp8"):
-        raise ValueError(f"a GLM DSA cache is bf16 or fp8, not {kv!r}")
-    return width + 16 if kv == "fp8" else 2 * width
+    """Bytes for bf16, vendor fp8, or the separately selected B0 latent layout.
+
+    b0_fp8 is not an indexer format or an executable TF_GLM_KV setting.
+    """
+    return mla_layout_row_bytes(width, kv)
 
 
 def mla_index_ring(capacity: int, rows: int) -> int:
@@ -272,7 +273,7 @@ def even_share(world: int):
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
                  prefill_rows: int = PREFILL_ROWS, mtp: bool | None = None, onepass: bool = False,
                  exl3_prompt: bool = True, prompt_split_k: bool = True, kv: str = "bf16", share=None,
-                 decode_rows: int | None = None) -> Geometry:
+                 decode_rows: int | None = None, latent_kv: str | None = None) -> Geometry:
     """GLM's engine: ``mtp`` whether it holds the MTP head's caches and decode buffers (None: when the checkpoint has
     one; GLM's TF_GLM_MTP can leave it out); ``onepass``: prompt chunks' sparse latent attention keeps no partials
     (TF_GLM_SPARSE_ONEPASS); an EXL3 checkpoint's ``exl3_prompt``: prompt chunks run the prompt expert kernels
@@ -281,7 +282,9 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     indexer's pooled keys; the indexer's per-token keys and gates are bf16 rings); ``share(family, total)``: this
     rank's share of a split dimension (GLM's ``tp.Layout``: heads, lin, dense, moe, vocab), default ``even_share``;
     ``decode_rows``: the decode windows' rows the buffers are sized for (default MLA_DECODE_ROWS; GLM's --parallel
-    asks for more when its own verify window and the batched one take more together)."""
+    asks for more when its own verify window and the batched one take more together).
+    ``latent_kv`` overrides only latent-plane layout; b0_fp8 is allocation preparation,
+    not an executable engine mode. Lifecycle guard buffers are not estimated here."""
     share = even_share(world) if share is None else share
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
@@ -314,15 +317,16 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
         fixed += 8 * prefill_rows * 16384 * 4 if prompt_split_k else 0
     count = attention + int(mtp)
     lw = int(t.get("kv_lora_rank", 512))
-    if kv != "bf16" and not latent:
-        raise ValueError("TF_GLM_KV=fp8 needs the latent cache")
+    latent_kv = latent_kind(kv, latent_kv, lw)
+    if (kv != "bf16" or latent_kv != "bf16") and not latent:
+        raise ValueError("quantized MLA rows need the latent cache")
     def bytes_at(capacity: int) -> int:
         scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows, onepass=onepass,
                                     share=share)
         if latent:
             # latent cache; a prompt chunk's latent partials (its dense pass runs MLA_PROMPT_ATT_ROWS rows at a time)
             # and absorbed rows (the MTP absorbs through the same buffers)
-            cache = count * capacity * mla_row_bytes(lw, kv)
+            cache = count * capacity * mla_row_bytes(lw, latent_kv)
             dense = min(capacity, minimum_slots) + prefill_rows
             scratch += (((dense + 511) // 512) * min(prefill_rows, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
                         + 4 * prefill_rows * heads * lw)
