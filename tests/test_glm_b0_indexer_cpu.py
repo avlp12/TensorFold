@@ -2,6 +2,7 @@
 import ast,importlib.util
 from pathlib import Path
 import struct,types,unittest,torch
+from unittest.mock import patch
 ROOT=Path(__file__).resolve().parents[1]/'src/tensorfold/families/glm5_next/cuda'
 spec=importlib.util.spec_from_file_location('b0index',ROOT/'b0_indexer.py');i=importlib.util.module_from_spec(spec);spec.loader.exec_module(i)
 torch.set_default_device('cpu');torch.set_num_threads(2)
@@ -35,6 +36,27 @@ class Indexer(unittest.TestCase):
   i.validate_selection(q,w,pk[:0],pos,e,True,True)
   for args in [(pk.float(),pos,True,False),(pk,pos.float(),True,False),(pk,pos,False,True),(pk,pos,1,False)]:
    with self.assertRaises(ValueError):i.validate_selection(q,w,args[0],args[1],e,args[2],args[3])
+ def test_ring_update_across_chunks_and_selection_views(self):
+  keys=torch.zeros(8,128,dtype=torch.bfloat16);gates=keys.clone();pools=torch.full((6,144),91,dtype=torch.uint8);error=torch.zeros((),dtype=torch.bool)
+  v=i.IndexerView((keys,gates,pools),16,error);raw=torch.arange(8*128).reshape(8,128).remainder(31).to(torch.bfloat16);gate=raw.float()/4+0.001
+  weight=torch.ones(128);bias=torch.zeros(128);ape=torch.zeros(4,128);calls=[]
+  def compress(k,g,a,e):
+   calls.append((k.clone(),g.clone(),a.clone()));return torch.full((len(k),132),7,dtype=torch.uint8)
+  with patch.object(i,'compress',compress):
+   v.update(raw[:3],gate[:3],weight,bias,ape,0);self.assertEqual(calls,[])
+   v.update(raw[3:],gate[3:],weight,bias,ape,3)
+  self.assertEqual(len(calls),1)
+  expected=i._key_norm(raw,weight,bias,128,1e-6).reshape(2,4,128)
+  self.assertTrue(torch.equal(calls[0][0],expected));self.assertTrue(torch.equal(calls[0][1],gate.bfloat16().reshape(2,4,128)))
+  self.assertTrue(bool((pools[:2,:132]==7).all()));self.assertTrue(bool((pools[:,132:]==91).all()))
+  captured={}
+  def choose(q,w,pk,pos,e,**kw):captured.update(shape=q.shape,pk=pk.clone(),pos=pos.tolist(),flags=kw);return None,None
+  with patch.object(i,'select',choose):v.choose(torch.zeros(2,4096,dtype=torch.bfloat16),torch.zeros(2,32,dtype=torch.bfloat16),6,prefill=True)
+  self.assertEqual(captured['shape'],(2,32,128));self.assertEqual(captured['pk'].shape,(2,132));self.assertEqual(captured['pos'],[6,7]);self.assertTrue(captured['flags']['short_prefill'])
+ def test_ring_overwrite_rejected_before_mutation(self):
+  keys=torch.zeros(8,128,dtype=torch.bfloat16);gates=keys.clone();pools=torch.zeros(6,144,dtype=torch.uint8);e=torch.zeros((),dtype=torch.bool);v=i.IndexerView((keys,gates,pools),16,e)
+  with self.assertRaises(ValueError):v.update(torch.ones(6,128,dtype=torch.bfloat16),torch.ones(6,128,dtype=torch.bfloat16),torch.ones(128),torch.zeros(128),torch.zeros(4,128),3)
+  self.assertFalse(bool(keys.any()));self.assertFalse(bool(pools.any()))
  def test_actual_loader_ape_preserves_f32_in_b0_mode(self):
   tree=ast.parse((ROOT/'weights.py').read_text());load=next(x for x in tree.body if isinstance(x,ast.FunctionDef) and x.name=='load')
   tf=next(x for x in load.body if isinstance(x,ast.FunctionDef) and x.name=='t');dsa=next(x for x in load.body if isinstance(x,ast.FunctionDef) and x.name=='dsa');ix=next(x for x in dsa.body if isinstance(x,ast.Assign) and any(isinstance(t,ast.Name) and t.id=='ix' for t in x.targets))

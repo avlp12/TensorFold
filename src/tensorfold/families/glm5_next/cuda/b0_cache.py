@@ -239,7 +239,7 @@ def segmented_write(views, rows, values):
         at += n
 
 
-def segmented_attention(views, rows, q, tokens, counts, out, scale):
+def segmented_attention(views, rows, q, tokens, counts, out, scale, *, full_selection=False):
     _segments(views, rows, q.shape[0])
     if (tokens is None) != (counts is None):
         raise ValueError("B0 sparse tokens and counts must both be present")
@@ -247,7 +247,11 @@ def segmented_attention(views, rows, q, tokens, counts, out, scale):
     for view, segment in zip(views, rows.segments, strict=True):
         _, pos, n = segment[:3]
         position = rows.pos[at:at+1]
-        dense = n if tokens is None else min(n, max(0, view.dense_limit - pos))
+        dense = 0 if full_selection else (n if tokens is None else min(n, max(0, view.dense_limit - pos)))
+        if full_selection:
+            if counts is None:
+                raise ValueError("full B0 selection requires counts for every row")
+            view.pool.error.logical_or_((counts[at:at+n] <= 0).any())
         if dense:
             view.dense(q[at:at+dense], position, out[at:at+dense], scale)
         if tokens is not None:

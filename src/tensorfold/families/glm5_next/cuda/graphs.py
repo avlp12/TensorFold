@@ -27,6 +27,8 @@ class Graphs:
         self.sparse: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}      # (rows, parity, pool bucket)
         self.sparse_mtp: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}       # (rows, pool bucket)
         w, st = e.w, e.st
+        if e.caches.b0_pools:
+            return  # B0 index ring bridge currently binds host positions eagerly.
         prof.active = False
         saved = list(st.cur)
         parities = (0, 1) if st.cur else (0,)

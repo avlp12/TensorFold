@@ -458,7 +458,7 @@ class State:
                  slots: Slots | None = None, slot: int = 0, kv: str = "bf16") -> None:
         self.caches = caches if caches is not None else Caches(w, capacity, kv=kv)
         if self.caches.latent_kv == "b0_fp8":
-            raise NotImplementedError("B0 allocation only: latent dispatch, lifecycle and rank error checks are not integrated")
+            raise NotImplementedError("B0 model startup not integrated: home ownership and DFlash2 parity remain pending")
         self.slots = slots if slots is not None else Slots(w, 1, rows)
         self.slot = slot
         kda_layers = [l for l in w.layers if l.kind == "kda"]
@@ -801,18 +801,29 @@ def dsa_rows(a, w: Weights, lc: torch.Tensor, pos_dev: torch.Tensor, b: Buffers,
     # sparse_np: every row is past the dense limit (a captured graph); else the host position decides
     all_sparse = sparse_np is not None or (host_pos is not None and host_pos >= c.dense_limit)
     sparse_rows = index is not None and (all_sparse or (host_pos is not None and host_pos + R - 1 >= c.dense_limit))
+    b0_index = None
     if index is not None:
         ik, ig, pk = index
         ix = a.index
         with prof.timed("dsa: indexer update"):
             mm(b, b.normed[rs], ix.kw, b.xs[rs], b.ikr[rs])
             glue.router(b.normed[rs], ix.gate, b.igr[rs])
-            sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+            if b0 is None:
+                sparse.index_update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, pos_dev)
+            else:
+                from .b0_indexer import IndexerView
+                b0_index = IndexerView(index, b0.extent.capacity, b0.pool.error)
+                b0_index.update(b.ikr[rs, :c.index_dim], b.igr[rs], ix.ln_w, ix.ln_b, ix.ape, host_pos)
     with prof.timed("dsa: absorb"):
         qa = latent.absorb_q(b.q[rs], a.absorb, s.qa[rs], prompt=b.prefill and latent.PROMPT_MMA)
     l2pf.site(layer, "o")
     ol = s.ol[rs]
     scale = c.qk_dim ** -0.5
+    if b0_index is not None:
+        mm(b, b.qr[rs], ix.qb, b.xs_qr[rs], b.qi[rs])
+        tokens, counts = b0_index.choose(b.qi[rs], b.ikr[rs, c.index_dim:], host_pos, prefill=b.prefill)
+        b0.sparse(qa, pos_dev, tokens, counts, ol, scale)
+        return latent.expand_v(ol, a.absorb, b.vn[rs], prompt=b.prefill and latent.PROMPT_MMA).view(R, HL * c.v_dim)
     if not all_sparse:
         # Rows past the dense limit are recomputed sparsely below, so the dense pass needs only the chunks up to it
         # and only the rows before it (a row's dense bits do not depend on the rows after it: latent.attention).
@@ -871,8 +882,26 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
         with prof.timed("dsa: indexer update"):
             mm(b, b.normed[:R], ix.kw, b.xs[:R], b.ikr[:R])
             glue.router(b.normed[:R], ix.gate, b.igr[:R])
-            sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, rows)
-        if select:
+            if b0_views is None:
+                sparse.seg_index_update(b.ikr[:R, :c.index_dim], b.igr[:R], ix.ln_w, ix.ln_b, ix.ape, ik, ig, pk, rows)
+        if b0_views is not None:
+            from .b0_indexer import IndexerView
+            mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
+            token_parts, count_parts, at = [], [], 0
+            for view, segment in zip(b0_views, rows.segments, strict=True):
+                base, start, n = segment[:3]
+                ring_base = segment[3] if rows.ring is not None else base
+                ring_size = rows.ring if rows.ring is not None else view.extent.capacity
+                local_index = (ik[ring_base:ring_base + ring_size], ig[ring_base:ring_base + ring_size],
+                               pk[base // 4:base // 4 + view.extent.capacity // 4 + 2])
+                index_view = IndexerView(local_index, view.extent.capacity, view.pool.error)
+                index_view.update(b.ikr[at:at+n, :c.index_dim], b.igr[at:at+n],
+                                  ix.ln_w, ix.ln_b, ix.ape, start)
+                t, count = index_view.choose(b.qi[at:at+n], b.ikr[at:at+n, c.index_dim:], start,
+                                             prefill=b.prefill)
+                token_parts.append(t); count_parts.append(count); at += n
+            tokens, counts = torch.cat(token_parts), torch.cat(count_parts)
+        elif select:
             with prof.timed("dsa: select tokens"):
                 mm(b, b.qr[:R], ix.qb, b.xs_qr[:R], b.qi[:R])
                 tokens, counts = sparse.seg_select_tokens(b.qi[:R], b.ikr[:R, c.index_dim:], pk, rows, sel)
@@ -884,7 +913,8 @@ def dsa_segments(layer: LayerW, w: Weights, lc: torch.Tensor, b: Buffers, R: int
             ol = latent.seg_attention(qa, lc, rows, tokens, counts, s, scale=c.qk_dim ** -0.5, out=s.ol[:R])
         else:
             from .b0_cache import segmented_attention
-            ol = segmented_attention(b0_views, rows, qa, tokens, counts, s.ol[:R], c.qk_dim ** -0.5)
+            ol = segmented_attention(b0_views, rows, qa, tokens, counts, s.ol[:R], c.qk_dim ** -0.5,
+                                     full_selection=index is not None)
     with prof.timed("dsa: expand"):
         o = latent.expand_v(ol, a.absorb, b.vn[:R]).view(R, HL * c.v_dim)
     return out_proj(w, b, o, a.o, qmm.group_sums(o, b.xs_ao[:R]), R, site=(layer.index, "a"))

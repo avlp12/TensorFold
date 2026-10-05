@@ -1268,6 +1268,8 @@ class MultiDecoder:
         """Rank 0: a lone stream into the one-stream graphs' home, slot 0 at the pool's first rows (SLOT, then
         kept prompts in the way evicted and its extent MOVEd); True once it is there."""
 
+        if self.e.caches.b0_pools:
+            return False  # No captured B0 home graph: do not move request rings for it.
         if self.e.graphed(lane.st):
             return True
         if lane.slot != 0:

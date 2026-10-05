@@ -168,3 +168,84 @@ def select(q, weights, packed, positions, error, *, prefill, short_prefill=False
     error.logical_or_(future.any())
     tokens = torch.where(future, -1, tokens)
     return tokens, (tokens >= 0).sum(-1).to(torch.int32)
+
+
+def _key_norm(x, weight, bias, dim, eps):
+    return torch.nn.functional.layer_norm(x.float(), (dim,), weight, bias, eps).type_as(x)
+
+
+# Lazily compile only on CUDA, preserving the original B0 leaf's compile policy.
+from functools import lru_cache
+
+
+@lru_cache(maxsize=1)
+def _compiled_key_norm():
+    from vllm.platforms import current_platform
+    from vllm.model_executor.utils import maybe_disable_graph_partition
+    backend = current_platform.simple_compile_backend
+    return torch.compile(_key_norm, dynamic=True, backend=backend,
+                         options=maybe_disable_graph_partition(backend))
+
+
+class IndexerView:
+    """Original B0 index computation on a request's existing TF rings and pool.
+
+    Pool rows retain the existing 144-byte allocation but only the canonical
+    132-byte prefix is used. Padding is not reinterpreted as quantized values.
+    This host-position bridge is eager; caller must not capture request state.
+    """
+    def __init__(self, index, capacity, error):
+        self.keys, self.gates, self.pools = index
+        k, g, p = index
+        if k.ndim != 2 or k.shape[1] != WIDTH or g.shape != k.shape or k.dtype != torch.bfloat16 or g.dtype != torch.bfloat16:
+            raise ValueError('B0 index rings must be matching BF16 [ring,128]')
+        if p.ndim != 2 or p.shape[1] < ROW_BYTES or p.dtype != torch.uint8 or p.stride(-1) != 1:
+            raise ValueError('B0 pooled index requires byte rows with 132-byte canonical prefix')
+        if type(capacity) is not int or capacity <= 0 or p.shape[0] < capacity // 4:
+            raise ValueError('pooled index allocation is smaller than the request extent')
+        if not (k.device == g.device == p.device):
+            raise ValueError('B0 index tensors must share a device')
+        _error(error, k.device)
+        self.capacity, self.error = capacity, error
+
+    def _window(self, start, count):
+        if self.keys.is_cuda and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError('host-position B0 index updates require eager execution')
+        if type(start) is not int or start < 0 or count <= 0 or start + count > self.capacity:
+            raise ValueError('index update outside request extent')
+        if count + start % 4 > self.keys.shape[0]:
+            raise ValueError('index ring cannot retain every token of completing pools')
+
+    def update(self, raw_keys, gates, norm_weight, norm_bias, ape, start):
+        count = raw_keys.shape[0]
+        self._window(start, count)
+        if raw_keys.shape != (count, WIDTH) or gates.shape != raw_keys.shape or raw_keys.dtype != torch.bfloat16 or gates.dtype not in (torch.bfloat16, torch.float32):
+            raise ValueError('BF16 keys and BF16/F32 projected gate buffer required')
+        if raw_keys.device != self.keys.device or gates.device != self.keys.device:
+            raise ValueError('projected keys/gates must be on the ring device')
+        if norm_weight.shape != (WIDTH,) or norm_bias.shape != (WIDTH,) or ape.shape != (4, WIDTH) or ape.dtype != torch.float32:
+            raise ValueError('index normalization vectors and original FP32 APE required')
+        if any(t.device != self.keys.device for t in (norm_weight, norm_bias, ape)):
+            raise ValueError("index normalization and APE must be on the ring device")
+        norm = _compiled_key_norm() if raw_keys.is_cuda else _key_norm
+        keys = norm(raw_keys, norm_weight.float(), norm_bias.float(), WIDTH, 1e-6)
+        self.error.logical_or_(~torch.isfinite(keys).all() | ~torch.isfinite(gates).all())
+        slots = torch.arange(start, start + count, device=keys.device, dtype=torch.int64) % self.keys.shape[0]
+        self.keys.index_copy_(0, slots, keys)
+        # TF router accumulates into FP32; B0 F.linear materializes BF16 gates.
+        self.gates.index_copy_(0, slots, gates.to(torch.bfloat16))
+        first, end = start // 4, (start + count) // 4
+        if first < end:
+            pools = torch.arange(first, end, device=keys.device, dtype=torch.int64)
+            rows = (pools[:, None] * 4 + torch.arange(4, device=keys.device)) % self.keys.shape[0]
+            packed = compress(self.keys[rows], self.gates[rows], ape, self.error)
+            # Leave the existing row padding unchanged; only B0 canonical bytes.
+            self.pools[pools, :ROW_BYTES] = packed
+
+    def choose(self, q, weights, start, *, prefill):
+        count = q.shape[0]
+        self._window(start, count)
+        positions = torch.arange(start, start + count, device=q.device, dtype=torch.int32)
+        resident = self.pools[:(start + count) // 4, :ROW_BYTES].contiguous()
+        return select(q.reshape(count, HEADS, WIDTH), weights, resident, positions, self.error,
+                      prefill=prefill, short_prefill=prefill and start + count <= 2048)
