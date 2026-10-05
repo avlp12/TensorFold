@@ -484,7 +484,7 @@ class State:
             # Every model state must already own its extent, including startup
             # home and reused scheduler slots. Never infer ownership from views.
             for i in range(len(self.caches.b0_pools)):
-                self.caches.b0_view(i, base, capacity, 0)
+                self.caches.b0_view(i, base, capacity, w.cfg.dense_limit)
         self.slots = slots if slots is not None else Slots(w, 1, rows)
         self.slot = slot
         kda_layers = [l for l in w.layers if l.kind == "kda"]

@@ -28,6 +28,7 @@ class Startup(unittest.TestCase):
         import types
         w = f.weights(indexed=False)
         w.meta['b0_speculation'] = True
+        w.cfg.dense_limit = 2048
         for i, layer in enumerate(w.layers): layer.index = i
         c = f.Caches(w, 32, kv='fp8', latent_kv='b0_fp8')
         z = f.torch.zeros
