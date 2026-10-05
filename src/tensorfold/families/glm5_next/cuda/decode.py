@@ -450,12 +450,15 @@ def _row_views(st, n: int, m: int) -> list[torch.Tensor]:
     """Views of the attention rows a snapshot of n tokens (m in the MTP head) depends on: latents or keys and values,
     and the indexer's pooled keys (its per-token keys and gates live in rings: the snapshot's ``tail``)."""
     views = [kc[:n] for kc in st.kc] + [vc[:n] for vc in st.vc if vc is not None]
+    views.extend(valid[:n] for valid in getattr(st, "b0_valid", ()))
     idx = st.index or []
     main_idx = idx[:len(st.kc)]
     for _, _, pk in main_idx:
         views.append(pk[:n // 4 + 1])
     if m > 0 and hasattr(st, "mtp_kc"):
         views.append(st.mtp_kc[:m])
+        if getattr(st, "b0_mtp_valid", None) is not None:
+            views.append(st.b0_mtp_valid[:m])
         if getattr(st, "mtp_vc", None) is not None:
             views.append(st.mtp_vc[:m])
         if len(idx) > len(st.kc):

@@ -209,6 +209,8 @@ class Caches:
             raise ValueError("quantized MLA rows need the latent cache")
         if self.latent_kv == "b0_fp8" and display:
             raise ValueError("B0 packed cache display allocation is not integrated")
+        self.b0_pools = []
+        self.b0_valid_planes = []
         planes: list[Plane] = []
         spanned: list[torch.Tensor] = []
         if display:
@@ -220,15 +222,28 @@ class Caches:
 
         def add(shape, div: int = 1, pad: int = 0, fmt: str = "bf16", tensor=None) -> int:
             n = rows // div + pad
-            if fmt == "b0_fp8":
+            if tensor is not None:
+                t = tensor
+            elif fmt == "b0_fp8":
                 t = torch.zeros((n, mla_layout_row_bytes(shape[0], fmt)), dtype=torch.uint8, device=dev)
             else:
                 t = tensor if tensor is not None else (kv8.zeros(n, shape[0], fmt, dev) if fmt != "bf16" else
                                                        torch.zeros((n, *shape), dtype=torch.bfloat16, device=dev))
-            planes.append(Plane(t, div, pad, spanned=tensor is not None))
+            planes.append(Plane(t, div, pad, spanned=tensor is not None and fmt != "b0_fp8"))
             return len(planes) - 1
 
         def attention_planes() -> tuple[int, int | None]:
+            if self.latent_kv == "b0_fp8":
+                from .b0_cache import PackedCachePool
+
+                pool = PackedCachePool(rows, device=dev)
+                self.b0_pools.append(pool)
+                k = add((c.kv_lora,), fmt="b0_fp8", tensor=pool.storage[:rows])
+                # Validity moves with payload through Arena.copy and snapshots.
+                # Generations identify ownership, so must NOT be copied with keys.
+                self.b0_valid_planes.append(len(planes))
+                planes.append(Plane(pool.valid[:rows]))
+                return k, None
             if self.latent:          # one 512-wide latent a token and layer (kc), no separate values (vc)
                 return add((c.kv_lora,), fmt=self.latent_kv, tensor=spanned.pop(0) if spanned else None), None
             return add((HL, c.qk_dim)), add((HL, c.v_dim))
@@ -275,12 +290,23 @@ class Caches:
     def ring_bytes(self) -> int:
         return sum(t.numel() * t.element_size() for pair in (self.rings or []) for t in pair)
 
+    def b0_auxiliary_bytes(self) -> int:
+        """Bytes not exposed as arena rows: generations, sink rows and error flags."""
+        return sum(p.generations.numel() * p.generations.element_size()
+                   + p.storage[-1].numel() + p.valid[-1].element_size() + p.error.element_size()
+                   for p in self.b0_pools)
+
+    def allocation_bytes(self) -> int:
+        return self.arena.nbytes() + self.ring_bytes() + self.b0_auxiliary_bytes()
+
     def bind(self, st: "State", base: int, size: int) -> None:
         """Point ``st``'s caches at tokens [base, base + size) of the pool."""
 
         view = lambda i: None if i is None else self.arena.view(i, base, size)     # noqa: E731
         st.kc = [view(i) for i in self.kc]
         st.vc = [view(i) for i in self.vc]
+        st.b0_valid = [view(i) for i in self.b0_valid_planes[:len(self.kc)]]
+        st.b0_mtp_valid = (view(self.b0_valid_planes[-1]) if self.b0_pools and self.mtp is not None else None)
         if self.mtp is not None:
             st.mtp_kc, st.mtp_vc = view(self.mtp[0]), view(self.mtp[1])
         if self.index is None:
@@ -414,6 +440,8 @@ class State:
         other.pos_dev = self.pos_dev.clone()
         other.mtp_pos_dev = self.mtp_pos_dev.clone()
         other.kc = [x.clone() for x in self.kc]
+        other.b0_valid = [x.clone() for x in self.b0_valid]
+        other.b0_mtp_valid = self.b0_mtp_valid.clone() if self.b0_mtp_valid is not None else None
         other.vc = [x.clone() if x is not None else None for x in self.vc]
         if self.index is not None:
             other.index = [tuple(x.clone() for x in trio) for trio in self.index]

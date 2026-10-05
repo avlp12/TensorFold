@@ -44,6 +44,7 @@ ns = {'__package__': PKG, 'torch': torch, 'kv8': types.SimpleNamespace(**kv),
       'latent_kind': layout.latent_kind, 'mla_layout_row_bytes': layout.row_bytes}
 extract(SRC / 'families/glm5_next/cuda/forward.py', {'Caches', 'State'}, ns)
 Caches, State = ns['Caches'], ns['State']
+extract(SRC / 'families/glm5_next/cuda/decode.py', {'_row_views'}, ns)
 
 
 def weights(mtp=False, indexed=True, device='cpu', width=512):
@@ -78,8 +79,8 @@ class Allocation(unittest.TestCase):
                             a = Caches(weights(mtp), rows, streams=2, ring=ring, kv=kv)
                             b = Caches(weights(mtp), rows, streams=2, ring=ring, kv=kv, latent_kv='b0_fp8')
                             count = 2 + int(mtp)
-                            want = count * rows * (656 - layout.row_bytes(512, kv))
-                            self.assertEqual(b.arena.nbytes() - a.arena.nbytes(), want)
+                            want = count * (rows * (656 - layout.row_bytes(512, kv)) + 9 * rows + 666)
+                            self.assertEqual(b.allocation_bytes() - a.allocation_bytes(), want)
                             ga = geometry.mla_geometry(config(mtp), 2, 8, latent=True, kv=kv)
                             gb = geometry.mla_geometry(config(mtp), 2, 8, latent=True, kv=kv, latent_kv='b0_fp8')
                             self.assertEqual(gb.bytes_at(rows) - ga.bytes_at(rows), want)
@@ -129,6 +130,63 @@ class Allocation(unittest.TestCase):
             Caches(weights(width=128), 64, latent_kv='b0_fp8')
         with self.assertRaises(ValueError):
             geometry.mla_geometry(dict(config(), kv_lora_rank=128), 2, 8, latent=True, latent_kv='b0_fp8')
+
+    def test_writer_uses_actual_arena_storage_and_exact_guard_accounting(self):
+        c = Caches(weights(indexed=False), 32, latent_kv='b0_fp8')
+        p = c.b0_pools[0]
+        extent = p.reserve('a', 0, 8)
+        value = torch.arange(512).reshape(1, 512).to(torch.bfloat16)
+        p.write(extent, torch.tensor([3]), value)
+        self.assertEqual(c.arena.planes[c.kc[0]].tensor.data_ptr(), p.storage.data_ptr())
+        self.assertTrue(bool(c.arena.planes[c.b0_valid_planes[0]].tensor[3]))
+        tensors = [t for pool in c.b0_pools for t in
+                   (pool.storage, pool.valid, pool.generations, pool.error)]
+        actual = sum(t.numel() * t.element_size() for t in tensors)
+        self.assertEqual(c.allocation_bytes(), actual)
+        self.assertEqual(actual, 2 * ((32 + 1) * (656 + 1 + 8) + 1))
+        p.check()
+
+    def test_arena_moves_validity_but_not_ownership_generation(self):
+        c = Caches(weights(indexed=False), 32, latent_kv='b0_fp8')
+        p = c.b0_pools[0]
+        a = p.reserve('a', 0, 8)
+        b = p.reserve('b', 8, 8)
+        p.write(a, torch.tensor([0, 3]), torch.ones(2, 512, dtype=torch.bfloat16))
+        c.arena.copy(0, 8, 8)
+        self.assertEqual(p.valid[8:16].tolist(), p.valid[:8].tolist())
+        self.assertEqual(p.generations[8:16].tolist(), [b.generation] * 8)
+        mapped, _ = p.selected(b, torch.tensor([[0, 3]]), torch.tensor([2], dtype=torch.int32))
+        self.assertEqual(mapped.tolist(), [[8, 11]])
+        p.check()
+
+    def test_snapshot_rows_preserve_validity_without_restoring_old_generation(self):
+        c = Caches(weights(indexed=False), 32, latent_kv='b0_fp8')
+        p = c.b0_pools[0]
+        a = p.reserve('a', 0, 8)
+        p.write(a, torch.tensor([0, 3]), torch.ones(2, 512, dtype=torch.bfloat16))
+        st = types.SimpleNamespace(slot=0)
+        c.bind(st, 0, 8)
+        saved = [x.clone() for x in ns['_row_views'](st, 4, 0)]
+        p.release(a)
+        b = p.reserve('b', 8, 8)
+        c.bind(st, 8, 8)
+        for dst, src in zip(ns['_row_views'](st, 4, 0), saved, strict=True):
+            dst.copy_(src)
+        self.assertEqual(p.valid[8:12].tolist(), [True, False, False, True])
+        self.assertEqual(p.generations[8:12].tolist(), [b.generation] * 4)
+        p.selected(b, torch.tensor([[0, 3]]), torch.tensor([2], dtype=torch.int32))
+        p.check()
+
+    def test_snapshot_includes_mtp_validity_only_when_mtp_rows_requested(self):
+        c = Caches(weights(mtp=True, indexed=False), 32, latent_kv='b0_fp8')
+        st = types.SimpleNamespace(slot=0)
+        c.bind(st, 0, 8)
+        main = ns['_row_views'](st, 4, 0)
+        both = ns['_row_views'](st, 4, 2)
+        self.assertEqual(len(main), 4)  # two payload + two validity planes
+        self.assertEqual(len(both), 6)
+        self.assertEqual([x.dtype for x in both[-2:]], [torch.uint8, torch.bool])
+        self.assertEqual([x.shape[0] for x in both[-2:]], [2, 2])
 
     def test_default_layouts_unchanged(self):
         for kv, dtype, width in [('bf16', torch.bfloat16, 512), ('fp8', torch.uint8, 528)]:

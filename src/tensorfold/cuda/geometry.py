@@ -6,7 +6,7 @@ import math
 import re
 
 from .capacity import Geometry, Weights, headers, itemsize
-from .mla_layout import latent_kind, row_bytes as mla_layout_row_bytes
+from .mla_layout import b0_guard_bytes, latent_kind, row_bytes as mla_layout_row_bytes
 
 PREFILL_ROWS = 2048     # a prompt chunk's rows: Flash Next and GLM keep buffers of this many rows
 PROMPT_SHARE = 32       # a dense prompt chunk's arrays take at most this fraction of the GPU's memory
@@ -284,7 +284,8 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     ``decode_rows``: the decode windows' rows the buffers are sized for (default MLA_DECODE_ROWS; GLM's --parallel
     asks for more when its own verify window and the batched one take more together).
     ``latent_kv`` overrides only latent-plane layout; b0_fp8 is allocation preparation,
-    not an executable engine mode. Lifecycle guard buffers are not estimated here."""
+    not an executable engine mode. B0 validity/generation/error and sink buffers
+    are included; transient per-operation buffers still need a runtime peak gate."""
     share = even_share(world) if share is None else share
     linear, attention = layer_counts(t)
     lin = t.get("linear_attn_config") or {}
@@ -327,6 +328,8 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
             # latent cache; a prompt chunk's latent partials (its dense pass runs MLA_PROMPT_ATT_ROWS rows at a time)
             # and absorbed rows (the MTP absorbs through the same buffers)
             cache = count * capacity * mla_row_bytes(lw, latent_kv)
+            if latent_kv == "b0_fp8":
+                cache += count * b0_guard_bytes(capacity)
             dense = min(capacity, minimum_slots) + prefill_rows
             scratch += (((dense + 511) // 512) * min(prefill_rows, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
                         + 4 * prefill_rows * heads * lw)
