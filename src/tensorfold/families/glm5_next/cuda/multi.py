@@ -479,6 +479,8 @@ class MultiDecoder:
         self.dflash_code = encode_policy(DFLASH_POLICY)
         if self.fill_budget:
             self.fill_costs = self._time_prompt_layers()
+        # Calibration used the serial home; the scheduler now owns the pool.
+        e.caches.b0_home_release()
 
     # -- the scheduler's view ----------------------------------------------------------------------------------------
     @property

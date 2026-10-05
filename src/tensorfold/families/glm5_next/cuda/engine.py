@@ -569,10 +569,16 @@ class GlmEngine:
         kvb = kvb_kind() if cfg.quant == "exl3" and LATENT else "bf16"
         weights_estimate = kvb_weights(weights_estimate, kvb)
         # TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows (``kv8``), half the bytes
-        from .kv8 import KINDS as KV_KINDS, kv_kind
+        from .kv8 import kv_kind
 
         kv = kv_kind()
-        if kv != "bf16" and not LATENT:
+        from .cache_profile import CacheProfile
+
+        self.cache_profile = CacheProfile.from_env(kv)
+        # Fail before capacity probing or loading hundreds of GB of weights.
+        # State retains its independent guard until the complete B0 path is ready.
+        self.cache_profile.require_ready()
+        if (kv != "bf16" or self.cache_profile.latent_kv != "bf16") and not LATENT:
             raise ValueError("TF_GLM_KV=fp8 holds the latent cache: it needs TF_GLM_LATENT=1")
         self.kv = kv
         # TF_GLM_MTP off: the MTP layer's tensors, caches and buffers are neither loaded nor estimated
@@ -614,7 +620,7 @@ class GlmEngine:
             g = mla_geometry(text, world, MAX_ROWS, share=share, minimum_slots=DENSE_CAPACITY, latent=LATENT,
                              prefill_rows=prompt_buffer_rows,
                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
-                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", kv=kv,
+                             prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", **self.cache_profile.options(),
                              decode_rows=multi_decode_rows(parallel, self.multi_window))
             # --parallel: every stream slot past the first (KDA states, conv windows, window scratch); the batched
             # verify window's buffers (TF_GLM_MULTI_WINDOW rows) beside the engine's own fit the decode rows the
@@ -673,7 +679,7 @@ class GlmEngine:
             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
-                                 KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos)] + self.draft_parameters.code()
+                                 *self.cache_profile.code(), len(cfg.eos), sum(cfg.eos)] + self.draft_parameters.code()
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -686,7 +692,7 @@ class GlmEngine:
                                "TF_GLM_HC_SPLIT*, TF_GLM_PREFILL_OVERLAP, TF_GLM_OVERLAP_PIECES, TF_GLM_DRAFT_DUMP, "
                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
-                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS): "
+                               "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_LATENT_KV, TF_GLM_ASSISTANT_ENDS): "
                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
                                "every rank the same flags")
@@ -740,7 +746,7 @@ class GlmEngine:
                 peers = [p for p in range(world) if p != rank]
                 self.comm.exchange_all({p: [a] for p in peers}, {p: [torch.empty_like(a)] for p in peers})
             torch.cuda.synchronize()
-        w = load(model_dir, rank=rank, world=world, mtp=self.mtp_on)
+        w = load(model_dir, rank=rank, world=world, mtp=self.mtp_on, indexer=self.cache_profile.indexer)
         w.comm = self.comm
         self.comm.ready("loading")                   # a peer stuck loading is named, not waited on in NCCL
         self.comm.barrier()
@@ -758,7 +764,7 @@ class GlmEngine:
         self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=graphs,
                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
-                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, kv=kv,
+                        split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, **self.cache_profile.options(),
                         display=display)
         if display and rank == 0:
             print(f"[tensorfold] {display >> 20} MiB of the pool in the GPU's display reservation "

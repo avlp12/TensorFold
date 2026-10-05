@@ -143,7 +143,8 @@ class Engine:
     def __init__(self, w: Weights, *, capacity: int = 2560, max_rows: int = 8, prefill_rows: int = PREFILL_ROWS,
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
                  taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
-                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None, display: int = 0) -> None:
+                 streams: int = 1, pool_rows: int | None = None, kv: str | None = None, display: int = 0,
+                 latent_kv: str | None = None) -> None:
         """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
         the indexer's pooled keys); ``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0:
         anywhere); ``split``: a ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt
@@ -193,8 +194,9 @@ class Engine:
 
         self.caches = Caches(w, pool_rows or capacity, streams=streams,
                              ring=index_ring(pool_rows or capacity, max(max_rows, prefill_rows)),
-                             kv=kv8.kv_kind() if kv is None else kv, display=display)
+                             kv=kv8.kv_kind() if kv is None else kv, display=display, latent_kv=latent_kv)
         self.slots = Slots(w, streams, max_rows)
+        self.caches.b0_home_claim(capacity)
         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)
         self.last_hidden: torch.Tensor | None = None
         self.head: torch.Tensor | None = None       # the last prompt's end logits row (``prefill``'s keep_head)
@@ -211,6 +213,8 @@ class Engine:
             self.reset()
 
     def reset(self) -> None:
+        if self.st is self.home:
+            self.caches.b0_home_reset(self.home.capacity)
         self.st.reset()
 
     def use(self, st: State) -> State:

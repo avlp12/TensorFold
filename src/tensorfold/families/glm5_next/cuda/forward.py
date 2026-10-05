@@ -306,6 +306,27 @@ class Caches:
         self.b0_bindings[key] = [pool.reserve(owner, base, size) for pool in self.b0_pools]
         self.b0_epoch += 1
 
+    def b0_home_claim(self, size):
+        """Reserve startup/serial home before any state can access the pool."""
+        if not self.b0_pools:
+            return
+        if self.b0_bindings:
+            raise ValueError("B0 home needs an empty pool; request ownership cannot be displaced")
+        self.b0_claim("engine-home", 0, size)
+
+    def b0_home_reset(self, size):
+        """New serial prompt invalidates prior home rows and captured generations."""
+        if not self.b0_pools:
+            return
+        if "engine-home" not in self.b0_bindings:
+            raise ValueError("B0 home was handed to the scheduler")
+        self.b0_reframe("engine-home", 0, size, used=0)
+
+    def b0_home_release(self):
+        """Finish startup calibration before the scheduler claims any requests."""
+        if self.b0_pools:
+            self.b0_release("engine-home")
+
     def b0_validate_reframe(self, key, base, size, *, used, move=False):
         if not self.b0_pools:
             return
@@ -458,7 +479,7 @@ class State:
                  slots: Slots | None = None, slot: int = 0, kv: str = "bf16") -> None:
         self.caches = caches if caches is not None else Caches(w, capacity, kv=kv)
         if self.caches.latent_kv == "b0_fp8":
-            raise NotImplementedError("B0 model startup not integrated: home ownership and DFlash2 parity remain pending")
+            raise NotImplementedError("B0 model startup remains gated: DFlash2 parity and integrated startup validation pending")
         self.slots = slots if slots is not None else Slots(w, 1, rows)
         self.slot = slot
         kda_layers = [l for l in w.layers if l.kind == "kda"]
