@@ -42,12 +42,18 @@ class AttentionResult:
     are masked to prevent out-of-bounds access, but set an error flag so they
     are rejected rather than accepted as a different attention problem.
     """
-    def __init__(self, values, error):
+    def __init__(self, values, error, *, error_latch=None):
+        if error_latch is not None and (error_latch.shape != () or error_latch.dtype != torch.bool or error_latch.device != values.device):
+            raise ValueError("error latch must be a scalar bool on the result device")
+        error = error | ~torch.isfinite(values).all()
+        if error_latch is not None:
+            error_latch.logical_or_(error)
+            error = error_latch
         self._values = values
         self._error = error
 
     def checked(self):
-        if torch.cuda.is_current_stream_capturing():
+        if self._values.is_cuda and torch.cuda.is_current_stream_capturing():
             raise RuntimeError('check attention results outside CUDA graph capture')
         if bool(self._error):
             raise ValueError('invalid selected cache index or length during attention')
@@ -56,12 +62,14 @@ class AttentionResult:
         return self._values
 
 
-def attention_capture(q, cache, indices, lengths, scale):
+def attention_capture(q, cache, indices, lengths, scale, *, error_latch=None):
     """Capture-compatible component; caller must check the returned result.
 
     Full engine integration must aggregate/check each layer's error flags before
     publishing tokens. This helper does not implement that scheduler contract.
     """
+    if error_latch is not None and (error_latch.shape != () or error_latch.dtype != torch.bool or error_latch.device != q.device):
+        raise ValueError("error latch must be a scalar bool on the query device")
     validate(q, cache, indices, lengths, scale, check_values=False)
     if q.device.type != 'cuda':
         raise ValueError('CUDA tensors required')
@@ -72,4 +80,4 @@ def attention_capture(q, cache, indices, lengths, scale):
     safe_lengths = lengths.clamp(0, indices.shape[1])
     from .b0_attention_kernel import attention
     values = attention(q, cache, safe_indices, safe_lengths, scale)
-    return AttentionResult(values, error)
+    return AttentionResult(values, error, error_latch=error_latch)
