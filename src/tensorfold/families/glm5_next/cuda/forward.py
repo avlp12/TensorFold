@@ -193,7 +193,8 @@ class Caches:
     layers' latent planes are then carved from one span that holds them."""
 
     def __init__(self, w: Weights, rows: int, *, streams: int = 1, ring: int | None = None,
-                 kv: str = "bf16", display: int = 0, latent_kv: str | None = None) -> None:
+                 kv: str = "bf16", display: int = 0, latent_kv: str | None = None,
+                 b0_attention: str = 'triton') -> None:
         from .pool import Arena, Plane
 
         c = w.cfg
@@ -238,7 +239,7 @@ class Caches:
             if self.latent_kv == "b0_fp8":
                 from .b0_cache import PackedCachePool
 
-                pool = PackedCachePool(rows, device=dev)
+                pool = PackedCachePool(rows, device=dev, attention=b0_attention)
                 self.b0_pools.append(pool)
                 k = add((c.kv_lora,), fmt="b0_fp8", tensor=pool.storage[:rows])
                 # Validity moves with payload through Arena.copy and snapshots.
@@ -402,9 +403,14 @@ class Caches:
 
     def b0_auxiliary_bytes(self) -> int:
         """Bytes not exposed as arena rows: generations, sink rows and error flags."""
-        return sum(p.generations.numel() * p.generations.element_size()
-                   + p.storage[-1].numel() + p.valid[-1].element_size() + p.error.element_size()
+        size = sum(p.generations.numel() * p.generations.element_size()
+                   + p.storage[p.rows:].numel() + p.valid[-1].element_size() + p.error.element_size()
                    for p in self.b0_pools)
+        if self.b0_pools and self.b0_pools[0].attention_backend == 'flashinfer':
+            from .b0_flashinfer import WORKSPACE_BYTES
+            # vLLM memoizes one workspace per device, shared by every layer.
+            size += WORKSPACE_BYTES + len(self.b0_pools) * (self.rows // 64 + 1) * 4
+        return size
 
     def allocation_bytes(self) -> int:
         return self.arena.nbytes() + self.ring_bytes() + self.b0_auxiliary_bytes()

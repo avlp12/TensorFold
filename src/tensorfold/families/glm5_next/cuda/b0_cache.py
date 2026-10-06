@@ -1,7 +1,8 @@
 """B0 packed-cache lifecycle component for a shared, request-partitioned pool.
 
-This is NOT enabled by TF_GLM_KV or wired to the engine scheduler yet. Each layer
-needs its own pool. CUDA operations and the sticky device error can be captured;
+The b0_fp8 profile connects each layer to an owned pool and checks all ranks
+before token publication. The optional original FlashInfer reader runs eagerly;
+the generic CUDA operations and sticky device error can be captured;
 check() must run outside capture, before publishing any token. A failed pool is
 poisoned for its lifetime, including subsequent graph replays and slot reuse.
 """
@@ -21,11 +22,19 @@ class Extent:
 
 
 class PackedCachePool:
-    def __init__(self, rows: int, *, device="cpu"):
+    def __init__(self, rows: int, *, device="cpu", attention="triton"):
         if type(rows) is not int or rows <= 0:
             raise ValueError("positive integer pool size required")
-        # The last row is a write sink for rejected indices, never readable.
-        self.storage = torch.zeros((rows + 1, ENTRY_BYTES), dtype=torch.uint8, device=device)
+        if attention not in ('triton', 'flashinfer'):
+            raise ValueError('B0 attention must be triton or flashinfer')
+        from .b0_flashinfer import page_padding
+        self.attention_backend = attention
+        self.reader = None
+        self.fallback_calls = 0
+        # Rejected writes go to rows. FlashInfer needs a whole physical page
+        # containing that sink; only logical rows are exposed to the allocator.
+        padding = page_padding(rows) if attention == 'flashinfer' else 1
+        self.storage = torch.zeros((rows + padding, ENTRY_BYTES), dtype=torch.uint8, device=device)
         self.valid = torch.zeros(rows + 1, dtype=torch.bool, device=device)
         self.error = torch.zeros((), dtype=torch.bool, device=device)
         self.generations = torch.zeros(rows + 1, dtype=torch.int64, device=device)
@@ -147,6 +156,22 @@ class PackedCachePool:
         from .b0_attention import attention_capture
 
         mapped, safe_lengths = self.selected(extent, indices, lengths)
+        fast_indices = mapped
+        if self.attention_backend == 'flashinfer' and mapped.shape[1] > 2048 and bool((safe_lengths <= 2048).all()):
+            # Columns beyond the active prefix contain no selected key. Keep
+            # transition rows with >2048 active keys on the exact generic path.
+            fast_indices = mapped[:, :2048].contiguous()
+        if self.attention_backend == 'flashinfer' and fast_indices.shape[1] <= 2048:
+            from .b0_flashinfer import Reader
+            from .b0_attention import AttentionResult
+            if self.reader is None:
+                self.reader = Reader(self.storage, self.rows)
+            values = self.reader(q, fast_indices, safe_lengths, scale)
+            return AttentionResult(values, self.error, error_latch=self.error)
+        if self.attention_backend == 'flashinfer':
+            # Vendor dense/sparse transition can select2051 keys. Preserve all
+            # keys using the checked reader rather than silently truncating.
+            self.fallback_calls += 1
         return attention_capture(q, self.storage[:self.rows], mapped, safe_lengths, scale,
                                  error_latch=self.error)
 

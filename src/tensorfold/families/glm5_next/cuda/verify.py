@@ -91,13 +91,13 @@ class BatchedVerify:
         c = w.cfg
         self.e, self.w, self.rows_max = e, w, rows
         dev = w.device
-        self.b = Buffers(w, rows, e.caches.rows)
+        self.b = Buffers(w, rows, e.home.capacity)
         if taps:
             self.b.set_taps(tuple(taps), c.hidden)
         self.taps = bool(taps)
         self.segs = seg_count(e.slots.count) if segs is None else int(segs)
         self.seg_rows = SegRows(rows, dev, max_segs=self.segs, ring=e.caches.ring if e.caches.rings else None)
-        self.sel = SelectScratch(rows, e.caches.rows, dev) if e.caches.index is not None else None
+        self.sel = SelectScratch(rows, e.home.capacity, dev) if e.caches.index is not None else None
         kda_layers = [l for l in w.layers if l.kind == "kda"]
         n = len(kda_layers)
         from .tp import of as layout_of

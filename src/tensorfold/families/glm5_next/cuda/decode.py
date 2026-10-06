@@ -144,7 +144,7 @@ class Engine:
                  graphs: bool = False, graph_rows: tuple[int, ...] = (1, 2, 3, 4), long_context: bool = False,
                  taps: tuple[int, ...] = (), grid: int = 0, split=None, mtp_rows: int | None = None,
                  streams: int = 1, pool_rows: int | None = None, kv: str | None = None, display: int = 0,
-                 latent_kv: str | None = None) -> None:
+                 latent_kv: str | None = None, b0_attention: str = 'triton') -> None:
         """``kv``: the DSA caches' format (``kv8``; default TF_GLM_KV, bf16 unless set: fp8 halves the latent cache and
         the indexer's pooled keys); ``grid``: prompt chunks start on multiples of it (TF_GLM_PROMPT_GRID; 0:
         anywhere); ``split``: a ``hcsplit.SplitSettings`` (TF_GLM_HC_SPLIT, TF_GLM_PREFILL_OVERLAP) for prompt
@@ -194,7 +194,8 @@ class Engine:
 
         self.caches = Caches(w, pool_rows or capacity, streams=streams,
                              ring=index_ring(pool_rows or capacity, max(max_rows, prefill_rows)),
-                             kv=kv8.kv_kind() if kv is None else kv, display=display, latent_kv=latent_kv)
+                             kv=kv8.kv_kind() if kv is None else kv, display=display, latent_kv=latent_kv,
+                             b0_attention=b0_attention)
         self.slots = Slots(w, streams, max_rows)
         self.caches.b0_home_claim(capacity)
         self.home = self.st = State(w, capacity, max_rows, caches=self.caches, slots=self.slots)

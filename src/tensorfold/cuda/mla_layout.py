@@ -33,10 +33,11 @@ def latent_kind(kv: str, override: str | None, width: int) -> str:
     return kind
 
 
-def b0_guard_bytes(rows: int) -> int:
+def b0_guard_bytes(rows: int, *, paged: bool = False) -> int:
     """Per-layer bytes besides rows*656: bool validity, int64 generations,
     one sink row (payload+validity+generation) and one sticky bool error.
     """
     if type(rows) is not int or rows <= 0:
         raise ValueError("positive integer B0 pool size required")
-    return rows * (1 + 8) + (656 + 1 + 8) + 1
+    padding = -(-(rows + 1) // 64) * 64 - rows if paged else 1
+    return rows * (1 + 8) + padding * 656 + 1 + 8 + 1

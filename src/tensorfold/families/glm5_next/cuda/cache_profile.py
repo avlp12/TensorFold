@@ -11,6 +11,7 @@ import os
 class CacheProfile:
     kv: str
     latent_kv: str
+    b0_attention: str = 'triton'
 
     @classmethod
     def from_env(cls, kv, env=None):
@@ -22,7 +23,10 @@ class CacheProfile:
             raise ValueError(f'unknown TF_GLM_LATENT_KV {kind!r}')
         if kind == 'b0_fp8' and kv != 'fp8':
             raise ValueError('B0 index rows need TF_GLM_KV=fp8 byte storage')
-        return cls(kv, kind)
+        reader = env.get('TF_GLM_B0_ATTENTION', '').strip() or 'triton'
+        if reader not in ('triton', 'flashinfer') or (reader != 'triton' and kind != 'b0_fp8'):
+            raise ValueError('FlashInfer B0 reader requires b0_fp8 latent storage')
+        return cls(kv, kind, reader)
 
     @property
     def indexer(self):
@@ -30,10 +34,14 @@ class CacheProfile:
 
     def code(self):
         return [('bf16', 'fp8').index(self.kv),
-                ('bf16', 'fp8', 'b0_fp8').index(self.latent_kv)]
+                ('bf16', 'fp8', 'b0_fp8').index(self.latent_kv),
+                ('triton', 'flashinfer').index(self.b0_attention)]
 
     def options(self):
-        return {'kv': self.kv, 'latent_kv': self.latent_kv}
+        out = {'kv': self.kv, 'latent_kv': self.latent_kv}
+        if self.b0_attention != 'triton':
+            out['b0_attention'] = self.b0_attention
+        return out
 
     def require_ready(self, env=None):
         if self.latent_kv != 'b0_fp8':
@@ -66,3 +74,12 @@ def aligned_pool_rows(capacity, spare_rows, alignment):
         raise ValueError('positive capacity/alignment and nonnegative spare rows required')
     minimum = -(-capacity // alignment) * alignment
     return max(minimum, (capacity + spare_rows) // alignment * alignment)
+
+
+def explicit_pool_rows(value, minimum, alignment):
+    """Optional total shared pool, independent of per-request scratch capacity."""
+    if value in (None, ''):
+        return None
+    if not str(value).isdecimal() or not minimum <= int(value) < 2**31:
+        raise ValueError('TF_GLM_POOL_TOKENS must preserve the request window and fit int32')
+    return -(-int(value) // alignment) * alignment

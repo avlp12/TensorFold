@@ -273,7 +273,8 @@ def even_share(world: int):
 def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560, latent: bool = False,
                  prefill_rows: int = PREFILL_ROWS, mtp: bool | None = None, onepass: bool = False,
                  exl3_prompt: bool = True, prompt_split_k: bool = True, kv: str = "bf16", share=None,
-                 decode_rows: int | None = None, latent_kv: str | None = None) -> Geometry:
+                 decode_rows: int | None = None, latent_kv: str | None = None,
+                 pool_rows: int | None = None, b0_attention: str = 'triton') -> Geometry:
     """GLM's engine: ``mtp`` whether it holds the MTP head's caches and decode buffers (None: when the checkpoint has
     one; GLM's TF_GLM_MTP can leave it out); ``onepass``: prompt chunks' sparse latent attention keeps no partials
     (TF_GLM_SPARSE_ONEPASS); an EXL3 checkpoint's ``exl3_prompt``: prompt chunks run the prompt expert kernels
@@ -321,24 +322,31 @@ def mla_geometry(t: dict, world: int, reserve: int, *, minimum_slots: int = 2560
     latent_kv = latent_kind(kv, latent_kv, lw)
     if (kv != "bf16" or latent_kv != "bf16") and not latent:
         raise ValueError("quantized MLA rows need the latent cache")
+    if b0_attention not in ('triton', 'flashinfer') or (b0_attention != 'triton' and latent_kv != 'b0_fp8'):
+        raise ValueError('FlashInfer reader requires B0 packed latent storage')
+    if pool_rows is not None and (type(pool_rows) is not int or pool_rows <= 0):
+        raise ValueError('positive integer total pool required')
     def bytes_at(capacity: int) -> int:
+        pool = capacity if pool_rows is None else pool_rows
         scratch = mla_chunk_scratch(t, world, capacity, latent=latent, prefill_rows=prefill_rows, onepass=onepass,
                                     share=share)
         if latent:
             # latent cache; a prompt chunk's latent partials (its dense pass runs MLA_PROMPT_ATT_ROWS rows at a time)
             # and absorbed rows (the MTP absorbs through the same buffers)
-            cache = count * capacity * mla_row_bytes(lw, latent_kv)
+            cache = count * pool * mla_row_bytes(lw, latent_kv)
             if latent_kv == "b0_fp8":
-                cache += count * b0_guard_bytes(capacity)
+                cache += count * b0_guard_bytes(pool, paged=b0_attention == 'flashinfer')
+                if b0_attention == 'flashinfer':
+                    cache += 394 * 1024 * 1024 + count * (pool // 64 + 1) * 4
             dense = min(capacity, minimum_slots) + prefill_rows
             scratch += (((dense + 511) // 512) * min(prefill_rows, MLA_PROMPT_ATT_ROWS) * heads * (lw + 2) * 4
                         + 4 * prefill_rows * heads * lw)
         else:
-            cache = count * capacity * heads * (kd + vd) * 2
+            cache = count * pool * heads * (kd + vd) * 2
             scratch += (2 if mtp else 1) * ((capacity + rows + 511) // 512) * rows * heads * (kd + 2) * 4
         # the indexer's pooled keys over the capacity, its per-token keys and gates in rings (forward.Caches)
-        ring = mla_index_ring(capacity, max(prefill_rows, rows))
-        cache += count * (2 * ring * index * 2 + (capacity // 4 + 2) * mla_row_bytes(index, kv))
+        ring = mla_index_ring(pool, max(prefill_rows, rows))
+        cache += count * (2 * ring * index * 2 + (pool // 4 + 2) * mla_row_bytes(index, kv))
         return fixed + cache + scratch
     return Geometry(bytes_at, reserve, minimum_slots)
 

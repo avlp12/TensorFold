@@ -578,6 +578,12 @@ class GlmEngine:
         # Fail before capacity probing or loading hundreds of GB of weights.
         # State retains its independent guard until the complete B0 path is ready.
         self.cache_profile.require_ready()
+        from .cache_profile import explicit_pool_rows
+        from .pool import ALIGN
+        configured_pool = explicit_pool_rows(os.environ.get('TF_GLM_POOL_TOKENS', ''),
+                                              (context or cfg.dense_limit) + MAX_ROWS, ALIGN)
+        if configured_pool is not None and (parallel <= 1 or self.cache_profile.indexer != 'b0'):
+            raise ValueError('explicit total pool currently requires parallel B0 cache profile')
         if self.cache_profile.indexer == "b0":
             if drafter is None or serial_only or world != 4 or parallel != 8 or context != 850000:
                 raise ValueError("B0 startup requires original DFlash2, TP4, parallel8 and context850000")
@@ -626,7 +632,7 @@ class GlmEngine:
                              prefill_rows=prompt_buffer_rows,
                              mtp=self.mtp_on, onepass=SPARSE_ONEPASS, exl3_prompt=prompt_kernels(),
                              prompt_split_k=cfg.quant == "exl3" and dense_kind() != "q4", **self.cache_profile.options(),
-                             decode_rows=multi_decode_rows(parallel, self.multi_window))
+                             decode_rows=multi_decode_rows(parallel, self.multi_window), pool_rows=configured_pool)
             if parallel > 1:
                 from .pool import ALIGN
                 raw_geometry = g
@@ -691,7 +697,7 @@ class GlmEngine:
             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
-                                 *self.cache_profile.code(), len(cfg.eos), sum(cfg.eos)] + self.draft_parameters.code()
+                                 *self.cache_profile.code(), configured_pool or 0, len(cfg.eos), sum(cfg.eos)] + self.draft_parameters.code()
         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
         plan = self.capacity_plan
         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
@@ -731,7 +737,7 @@ class GlmEngine:
             # TF_GLM_DISPLAY_KV_MIB: the display reservation's bytes too, which free memory never counted
             display = display_kv.credit()
             from .cache_profile import aligned_pool_rows
-            pool_rows = aligned_pool_rows(capacity, max(0, self.cache_bytes + display - states) // per_token, ALIGN)
+            pool_rows = configured_pool or aligned_pool_rows(capacity, max(0, self.cache_bytes + display - states) // per_token, ALIGN)
             display_rows = pool_rows - (capacity + max(0, self.cache_bytes - states) // per_token) // ALIGN * ALIGN
             if pool_rows < ALIGN:
                 raise ValueError(f"--parallel {parallel}: a pool of {pool_rows} tokens is less than one {ALIGN}-token "
@@ -774,9 +780,9 @@ class GlmEngine:
         if drafter is not None:
             from .dflash2 import Drafter
 
-            self.drafter = Drafter(drafter, w, capacity=pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING,
+            self.drafter = Drafter(drafter, w, capacity=capacity if configured_pool else pool_rows or capacity, tap_rows=MAX_ROWS, ring=DRAFT_RING,
                                    block=self.draft_parameters.block)
-        self.e = Engine(w, capacity=pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=graphs,
+        self.e = Engine(w, capacity=capacity if configured_pool else pool_rows or capacity, max_rows=MAX_ROWS, prefill_rows=prefill_rows, graphs=graphs,
                         graph_rows=GRAPH_ROWS + WIDE_GRAPHS, long_context=long_context,
                         taps=self.drafter.tap_layers if self.drafter is not None else (), grid=self.grid,
                         split=self.split, mtp_rows=MTP_ROWS, streams=parallel, pool_rows=pool_rows, **self.cache_profile.options(),

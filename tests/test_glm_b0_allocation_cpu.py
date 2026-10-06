@@ -109,7 +109,7 @@ class Allocation(unittest.TestCase):
 
     def test_state_cannot_execute_unwired_b0_planes(self):
         c = Caches(weights(), 64, latent_kv='b0_fp8')
-        with self.assertRaisesRegex(NotImplementedError, 'not integrated'):
+        with self.assertRaisesRegex(NotImplementedError, 'integrated DFlash2 path'):
             State(weights(), 64, 8, caches=c)
 
     def test_display_and_expanded_cache_rejected(self):
