@@ -36,7 +36,7 @@ class Reader:
         import hashlib
         import inspect
         from pathlib import Path
-        from vllm.v1.attention.backends.mla import flashinfer_mla_sparse_sm120 as original
+        from . import b0_flashinfer_backend as original
         # This is the original serving image's implementation, not a newer API
         # inferred from its name. Pin the actual source before calling it.
         expected = ORIGINAL_SOURCE_SHA256
